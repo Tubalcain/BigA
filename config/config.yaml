@@ -1,0 +1,102 @@
+# BigA Stock Analysis Configuration
+
+# Application Settings
+app:
+  title: "大A股数据分析"
+  version: "1.0.0"
+  debug: true
+
+# Data Sources Configuration
+data_sources:
+  # TuShare Pro - 推荐使用，数据质量高
+  tushare:
+    enabled: true
+    token: ""  # 需要从 https://tushare.pro 获取
+    base_url: "http://api.tushare.pro"
+    timeout: 30
+  
+  # AKShare - 免费开源，无需注册
+  akshare:
+    enabled: true
+    base_url: "https://akshare.akfamily.xyz"
+    timeout: 30
+
+# Analysis Settings
+analysis:
+  # Technical Analysis
+  technical:
+    indicators:
+      - MA  # 移动平均线
+      - MACD
+      - RSI
+      - BOLL  # 布林带
+      - KDJ
+    
+    ma_periods: [5, 10, 20, 60]
+    rsi_period: 14
+    macd_params:
+      fast: 12
+      slow: 26
+      signal: 9
+  
+  # Portfolio Analysis
+  portfolio:
+    risk_free_rate: 0.03  # 无风险利率 3%
+    trading_days: 252     # 年交易日数
+
+# Visualization Settings
+visualization:
+  # Chart Theme
+  theme:
+    bg_color: "white"
+    grid_color: "lightgray"
+    up_color: "#FF4444"    # 上涨红色
+    down_color: "#00AA00"  # 下跌绿色
+    volume_color: "#666666"
+  
+  # Default Chart Settings
+  kline:
+    height: 600
+    candlestick: true
+    volume: true
+    indicators: true
+
+# Cache Settings
+cache:
+  enabled: true
+  ttl: 300  # 缓存时间 5分钟
+  max_size: 1000
+
+# UI Settings
+ui:
+  # Page Configuration
+  pages:
+    - name: "首页"
+      icon: "🏠"
+      module: "_home"
+    - name: "股票分析"
+      icon: "📈"
+      module: "_stock_analysis"
+    - name: "股票筛选"
+      icon: "🔍"
+      module: "_screener"
+    - name: "投资组合"
+      icon: "💼"
+      module: "_portfolio"
+    - name: "市场分析"
+      icon: "📊"
+      module: "_market"
+  
+  # Display Settings
+  sidebar:
+    default_state: "expanded"
+  
+  main:
+    wide_mode: true
+    theme:
+      primary_color: "#1f77b4"
+      background_color: "#ffffff"
+      secondary_background_color: "#f0f2f6"
+      text_color: "#262730"
+      font: "sans serif"
+
