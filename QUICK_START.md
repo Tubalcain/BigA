@@ -37,24 +37,17 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**如果遇到依赖安装错误**，有三个选项：
-
-1. **最小安装**（推荐，仅安装必需包）：
+**如果遇到依赖安装错误**，运行：
 ```bash
 install_minimal.bat
 ```
 
-2. **完整安装**：
-```bash
-install_deps.bat
-```
-
-3. **手动安装**：
+或手动安装：
 ```bash
 venv\Scripts\pip.exe install akshare streamlit plotly pandas numpy requests python-dateutil
 ```
 
-详细解决方案见 [DEPENDENCY_FIX.md](DEPENDENCY_FIX.md)
+详细问题排查见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 
 ### 3. 运行应用
 ```bash

@@ -65,7 +65,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> **注意**：如果Windows控制台出现乱码，请参考 `ENCODING_FIX.md` 文件解决编码问题。
+> **注意**：如有问题，请查看 `TROUBLESHOOTING.md` 获取解决方案。
 
 ### 2. 配置数据源
 
