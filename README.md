@@ -98,30 +98,35 @@ streamlit run app.py
 
 ### 主要模块
 
-#### 1. 股票行情 (Stock Quotes)
+#### 1. 📊 交易决策 (Trading Decision) ⭐ 推荐
+- 多维度买卖信号分析（MA/MACD/RSI/KDJ）
+- 精确买卖点标注（K线图自动标记）
+- 智能止损止盈计算（自动计算关键价位）
+- 仓位管理系统（根据风险自动计算仓位）
+- 成交量分析（识别放量缩量）
+- 动量评分系统（15分制综合评分）
+- **详细指标说明**：[TRADING_INDICATORS_GUIDE.md](TRADING_INDICATORS_GUIDE.md)
+- **完整文档索引**：[DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md)
+
+#### 2. 📈 股票行情 (Stock Quotes)
 - 实时/历史行情查询
 - K线图展示
 - 技术指标分析
 
-#### 2. 股票筛选器 (Stock Screener)
+#### 3. 🔍 股票筛选器 (Stock Screener)
 - 多条件筛选
 - 自定义指标
 - 结果导出
 
-#### 3. 投资组合 (Portfolio)
+#### 4. 💼 投资组合 (Portfolio)
 - 持仓管理
 - 收益分析
 - 风险评估
 
-#### 4. 市场分析 (Market Analysis)
+#### 5. 📊 市场分析 (Market Analysis)
 - 市场涨跌统计
 - 板块轮动分析
 - 资金流向追踪
-
-#### 5. 研究报告 (Research Reports)
-- 基本面分析
-- 技术面分析
-- 投资建议
 
 ## 项目结构
 

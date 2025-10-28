@@ -19,19 +19,26 @@ st.info("""
 # 功能导航
 st.subheader("📋 功能导航")
 
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 
 with col1:
+    if st.button("📊 交易决策", use_container_width=True):
+        st.switch_page("pages/_trading_decision.py")
+    st.markdown("**最推荐** - 买卖信号分析，交易决策支持")
+
+with col2:
     if st.button("📈 股票分析", use_container_width=True):
         st.switch_page("pages/_stock_analysis.py")
     st.markdown("查看股票行情、K线图、技术指标")
 
-with col2:
+col3, col4 = st.columns(2)
+
+with col3:
     if st.button("🔍 股票筛选", use_container_width=True):
         st.switch_page("pages/_screener.py")
     st.markdown("多条件筛选优质股票")
 
-with col3:
+with col4:
     if st.button("💼 投资组合", use_container_width=True):
         st.switch_page("pages/_portfolio.py")
     st.markdown("管理投资组合，分析收益")
