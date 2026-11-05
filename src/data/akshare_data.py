@@ -17,8 +17,7 @@ from .cache import get_cache, make_cache_key
 from .config import get_data_config
 from .fetch import DataFetchError, safe_fetch
 from .quality import (
-    attach_meta,
-    clean_ohlcv,
+    compact_date,
     empty_flow,
     empty_index,
     empty_list,
@@ -27,10 +26,12 @@ from .quality import (
     empty_quotes,
     infer_limit_pct,
     match_exchange,
-    normalize_ohlcv,
+    normalize_adjust,
+    normalize_period,
     normalize_quotes,
     normalize_stock_code,
     normalize_stock_list,
+    prepare_ohlcv,
     rename_columns,
     stamp_frame,
     to_numeric,
@@ -50,6 +51,8 @@ def _import_akshare():
 
 class AKShareData:
     """AKShare 数据源。方法失败时返回空表，必要时回退到 TuShare。"""
+
+    name = "akshare"
 
     def __init__(self, config=None):
         self.config = config or get_data_config()
@@ -146,88 +149,79 @@ class AKShareData:
             adjust: "" 不复权, qfq/hfq 或 前复权/后复权
         """
         code = normalize_stock_code(stock_code)
-        period_key = _normalize_period(period)
-        adj = _normalize_adjust(adjust if adjust is not None else self.source_cfg.adjust)
-        start = _compact_date(start_date)
-        end = _compact_date(end_date)
+        period_key = normalize_period(period)
+        adj = normalize_adjust(adjust if adjust is not None else self.source_cfg.adjust)
+        start = compact_date(start_date)
+        end = compact_date(end_date)
+        if not code:
+            return empty_ohlcv(
+                "akshare",
+                error=f"invalid stock code: {stock_code!r}",
+                issues=["invalid stock code"],
+            )
 
-        def loader():
-            return self._fetch_history(code, start, end, period_key, adj)
+        key = ("history", code, start, end, period_key, adj)
+        cache_key = make_cache_key("AKShareData", *key)
+        cached = self.cache.get(cache_key)
+        if cached is not None and validate_ohlcv(cached)[0]:
+            return cached
 
-        df = self._cached(
-            ("history", code, start, end, period_key, adj),
-            self.cache_ttl,
-            loader,
-            empty_ohlcv("akshare"),
-        )
+        df = self._fetch_history(code, start, end, period_key, adj)
         ok, issues = validate_ohlcv(df)
-        if not ok and allow_fallback:
+        if ok:
+            self.cache.set(cache_key, df, ttl=self.cache_ttl)
+            return df
+        if allow_fallback:
             fallback = self._fallback_history(code, start, end, period_key, adj)
-            if fallback is not None:
+            if fallback is not None and validate_ohlcv(fallback)[0]:
                 return fallback
-        if not ok:
-            logger.warning("AKShare 历史数据不可用 %s: %s", code, issues)
-        return df
+        logger.warning("AKShare 历史数据不可用 %s: %s", code, issues)
+        return df if df is not None else empty_ohlcv("akshare", issues=issues)
 
     def _fetch_history(self, code, start, end, period, adjust):
-        empty = empty_ohlcv("akshare")
         if not code:
-            return empty
+            return empty_ohlcv("akshare", issues=["invalid stock code"])
         ak = self._client()
-        period_map = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}
-        ak_period = period_map.get(period, "daily")
+        ak_period = period if period in ("daily", "weekly", "monthly") else "daily"
 
-        attempts = [
-            lambda: ak.stock_zh_a_hist(
-                symbol=code, period=ak_period, start_date=start, end_date=end, adjust=adjust
-            ),
-            lambda: ak.stock_zh_a_hist(
-                symbol=code, period=ak_period, start_date=start, end_date=end, adjust=""
-            ),
-            lambda: ak.stock_zh_a_hist(
-                symbol=code, period=ak_period, start_date=start, end_date=end
-            ),
-            lambda: ak.stock_zh_a_hist(symbol=code, period=ak_period, adjust=adjust or ""),
-        ]
-        # 部分版本用英文复权参数
-        if adjust in ("qfq", "hfq"):
-            attempts.insert(
-                0,
-                lambda: ak.stock_zh_a_hist(
-                    symbol=code, period=ak_period, start_date=start, end_date=end, adjust=adjust
-                ),
-            )
-        if adjust in ("前复权", "后复权"):
-            attempts.insert(
-                0,
-                lambda: ak.stock_zh_a_hist(
-                    symbol=code, period=ak_period, start_date=start, end_date=end, adjust=adjust
-                ),
-            )
+        specs = []
+        def _add(**kwargs):
+            if kwargs not in specs:
+                specs.append(dict(kwargs))
+
+        _add(symbol=code, period=ak_period, start_date=start, end_date=end, adjust=adjust)
+        if adjust:
+            _add(symbol=code, period=ak_period, start_date=start, end_date=end, adjust="")
+        _add(symbol=code, period=ak_period, start_date=start, end_date=end)
+        _add(symbol=code, period=ak_period, adjust=adjust or "")
 
         raw = None
-        last_error = None
-        for attempt in attempts:
-            raw = self._fetch(attempt, default=None, label=f"stock_zh_a_hist:{code}", retries=1)
+        for kwargs in specs:
+            raw = self._fetch(
+                lambda kwargs=kwargs: ak.stock_zh_a_hist(**kwargs),
+                default=None,
+                label=f"stock_zh_a_hist:{code}",
+                retries=1,
+            )
             if isinstance(raw, pd.DataFrame) and not raw.empty:
                 break
-            last_error = last_error
         if raw is None or (isinstance(raw, pd.DataFrame) and raw.empty):
-            logger.warning("AKShare 未返回历史数据 %s (%s)", code, last_error)
-            return empty
+            logger.warning("AKShare 未返回历史数据 %s", code)
+            return empty_ohlcv("akshare", error="upstream empty", issues=["empty frame"])
 
-        df = normalize_ohlcv(raw, source="akshare", code=code, adjust=adjust)
-        df = clean_ohlcv(
-            df,
+        df = prepare_ohlcv(
+            raw,
+            source="akshare",
+            code=code,
+            adjust=adjust,
+            start=start,
+            end=end,
             max_abs_return=self.config.quality_max_abs_return,
             drop_outliers=self.config.drop_outlier_bars,
         )
-        if start:
-            df = df[df["date"] >= pd.to_datetime(start)]
-        if end:
-            df = df[df["date"] <= pd.to_datetime(end)]
-        df = df.reset_index(drop=True)
-        return attach_meta(stamp_frame(df, "akshare"), period=period, code=code)
+        df.attrs["period"] = period
+        df.attrs["code"] = code
+        return df
 
     def get_spot_snapshot(self, force=False):
         """全市场实时快照（东财）。供列表、报价、涨跌统计复用。"""
@@ -254,7 +248,7 @@ class AKShareData:
             return loader()
         return self._cached(("spot_snapshot",), self.ttl_realtime, loader, empty_quotes("akshare"))
 
-    def get_stock_list(self, exchange="所有"):
+    def get_stock_list(self, exchange="所有", allow_fallback=True):
         """
         股票列表。优先返回带行情字段的快照，便于筛选器按市值/涨跌幅/成交量过滤。
         """
@@ -275,7 +269,7 @@ class AKShareData:
 
         df = self._cached(("stock_list",), self.ttl_list, loader, empty_list("akshare"))
         if df is None or df.empty:
-            if self.config.fallback:
+            if allow_fallback and self.config.fallback:
                 try:
                     from .tushare_data import TuShareData
 
@@ -284,7 +278,7 @@ class AKShareData:
                         return other.get_stock_list(exchange, allow_fallback=False)
                 except Exception as exc:
                     logger.warning("股票列表回退失败: %s", exc)
-            return empty_list("akshare")
+            return empty_list("akshare", error="stock list unavailable")
         if "code" in df.columns:
             mask = df["code"].map(lambda c: match_exchange(c, exchange))
             df = df[mask].reset_index(drop=True)
@@ -565,9 +559,9 @@ class AKShareData:
             return cal
         work = cal.copy()
         if start_date:
-            work = work[work["date"] >= pd.to_datetime(_compact_date(start_date))]
+            work = work[work["date"] >= pd.to_datetime(compact_date(start_date), format="%Y%m%d", errors="coerce")]
         if end_date:
-            work = work[work["date"] <= pd.to_datetime(_compact_date(end_date))]
+            work = work[work["date"] <= pd.to_datetime(compact_date(end_date), format="%Y%m%d", errors="coerce")]
         return work.reset_index(drop=True)
 
     def is_trading_day(self, day=None):
@@ -701,54 +695,6 @@ class AKShareIndicator:
             if self.df is None:
                 raise ValueError("请先调用 calculate_ma(hist, periods) 传入行情")
             self._analyzer = TechnicalAnalyzer(self.df)
-
-
-def _compact_date(value):
-    if value is None or value == "":
-        return ""
-    if hasattr(value, "strftime"):
-        return value.strftime("%Y%m%d")
-    text = str(value).strip()
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits[:8] if digits else ""
-
-
-def _normalize_period(period):
-    mapping = {
-        "daily": "daily",
-        "d": "daily",
-        "日线": "daily",
-        "日": "daily",
-        "weekly": "weekly",
-        "w": "weekly",
-        "周线": "weekly",
-        "周": "weekly",
-        "monthly": "monthly",
-        "m": "monthly",
-        "月线": "monthly",
-        "月": "monthly",
-    }
-    if period is None:
-        return "daily"
-    return mapping.get(str(period).strip().lower(), mapping.get(str(period).strip(), "daily"))
-
-
-def _normalize_adjust(adjust):
-    if adjust is None:
-        return ""
-    text = str(adjust).strip()
-    mapping = {
-        "": "",
-        "none": "",
-        "raw": "",
-        "nadj": "",
-        "qfq": "qfq",
-        "hfq": "hfq",
-        "前复权": "qfq",
-        "后复权": "hfq",
-        "不复权": "",
-    }
-    return mapping.get(text, mapping.get(text.lower(), text))
 
 
 def _quote_from_item_value(raw, code):

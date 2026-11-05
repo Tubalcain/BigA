@@ -43,10 +43,12 @@ with st.sidebar:
 if len(st.session_state.portfolio) > 0:
     try:
         from src.analysis.portfolio import PortfolioAnalyzer
-        from src.data.akshare_data import AKShareData
+        from src.data import get_data_source
         
         analyzer = PortfolioAnalyzer(st.session_state.portfolio)
-        ak_data = AKShareData()
+        ak_data = get_data_source(st.session_state.get("data_source", "akshare"))
+        if not ak_data.is_available():
+            ak_data = get_data_source("akshare")
         
         # 获取当前价格
         current_prices = {}

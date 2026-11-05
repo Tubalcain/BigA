@@ -17,9 +17,12 @@ tab1, tab2, tab3 = st.tabs(["🌍 市场概况", "📈 涨跌统计", "💰 资�
 
 
 def _load_client():
-    from src.data.akshare_data import AKShareData
+    from src.data import get_data_source
 
-    return AKShareData()
+    client = get_data_source(st.session_state.get("data_source", "akshare"))
+    if not client.is_available():
+        client = get_data_source("akshare")
+    return client
 
 
 def _index_metric(column, indices, keyword, label):

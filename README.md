@@ -26,10 +26,12 @@
 
 质量约定：
 
-- 中英列名映射到同一套英文 schema，数值强制转换
-- 日期为 **Asia/Shanghai 日历日**（naive midnight），`df.attrs['timezone']` / `source` 可查
-- 去重、丢弃非法 OHLC、标记 `is_outlier`；空表带齐列名，不抛给页面
-- TTL 缓存 + 超时重试；`fallback: true` 时 AKShare ↔ TuShare 互为后备
+- 页面通过 `get_data_source("akshare"|"tushare")` 取适配器；工厂**不会**在无 token 时悄悄换成另一源。历史/列表方法在 `fallback: true` 时仍会回退。
+- 股票代码必须是 6 位（`000001.SZ` 可以），不会把 `1` 补成平安银行。
+- 中英列名映射到同一套英文 schema；报价丢掉未知列（如新浪的「买入/卖出」）。
+- 日期为 **Asia/Shanghai 日历日**（naive midnight）；失败原因在 `df.attrs['issues']` / `error`。
+- 去重、丢弃缺 OHLC 的 bar、把 high/low 钳到包含 open/close，标记 `is_outlier`。
+- TTL 缓存只保存校验通过的历史 K 线；超时失败立刻返回，不等后台线程跑完。
 
 ## 快速开始
 

@@ -43,9 +43,11 @@ with st.sidebar:
 # 主内容区域
 if screen_btn:
     try:
-        from src.data.akshare_data import AKShareData
+        from src.data import get_data_source
 
-        ak_data = AKShareData()
+        ak_data = get_data_source(st.session_state.get("data_source", "akshare"))
+        if not ak_data.is_available():
+            ak_data = get_data_source("akshare")
 
         with st.spinner("正在获取股票列表..."):
             df = ak_data.get_stock_list(exchange)

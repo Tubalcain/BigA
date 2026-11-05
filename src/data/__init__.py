@@ -24,14 +24,15 @@ __all__ = [
 
 
 def get_data_source(name=None):
-    """按名称返回数据源实例。name 为空时使用配置中的 primary。"""
+    """
+    按名称返回数据源实例，不在工厂里偷偷换源。
+
+    name 为空时用配置 `data_sources.primary`。
+    主源失败时的回退由 get_history_data / get_stock_list 等按 config.fallback 处理。
+    页面若选了 TuShare，应检查 is_available() 后再决定是否改用 akshare。
+    """
     cfg = get_data_config()
     source = (name or cfg.primary or "akshare").strip().lower()
     if source in ("tushare", "ts"):
-        client = TuShareData()
-        if client.is_available():
-            return client
-        if cfg.fallback:
-            return AKShareData()
-        return client
-    return AKShareData()
+        return TuShareData(cfg)
+    return AKShareData(cfg)

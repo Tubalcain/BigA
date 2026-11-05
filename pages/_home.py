@@ -50,9 +50,11 @@ st.markdown("---")
 st.subheader("📊 市场概况")
 
 try:
-    from src.data.akshare_data import AKShareData
+    from src.data import get_data_source
 
-    ak_data = AKShareData()
+    ak_data = get_data_source(st.session_state.get("data_source", "akshare"))
+    if not ak_data.is_available():
+        ak_data = get_data_source("akshare")
     # 首页只拉指数，避免每次打开都打全市场快照（易限流、很慢）
     indices = ak_data.get_index_quotes()
     overview = ak_data.get_market_overview(light=True)

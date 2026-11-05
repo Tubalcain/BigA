@@ -122,6 +122,7 @@ ModuleNotFoundError: No module named 'src.data'
 3. 设置 `TUSHARE_TOKEN` 后可自动回退
 4. 运行 `python examples/test_data_source.py` 看是哪一层失败
 5. 热门代码：000001, 000002, 600519, 600000
+6. 代码必须是 6 位，`1` / `0001` 不会再被补成 `000001`
 
 ### 问题8：缺少必要的列（open, close等）
 **错误信息**：

@@ -42,15 +42,22 @@ def is_rate_limited(exc):
 
 
 def call_with_timeout(func, timeout, *args, **kwargs):
-    """在独立线程中执行调用，超时则放弃。timeout<=0 表示不限时。"""
+    """
+    在独立线程中执行调用。timeout<=0 表示不限时。
+
+    注意：底层线程无法被强制杀掉；超时后用 wait=False 立即把错误返回给调用方，
+    避免 ThreadPoolExecutor 上下文退出时再阻塞等任务跑完。
+    """
     if not timeout or timeout <= 0:
         return func(*args, **kwargs)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(func, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout)
-        except FutureTimeout as exc:
-            raise DataFetchError(f"调用超时（{timeout}s）: {func}") from exc
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(func, *args, **kwargs)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeout as exc:
+        raise DataFetchError(f"调用超时（{timeout}s）: {func}") from exc
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def with_retry(func, retries=3, timeout=30, delay=0.8, retry_exceptions=None):

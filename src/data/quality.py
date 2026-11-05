@@ -118,44 +118,54 @@ _NUMERIC_COLS = {
 }
 
 
-def empty_ohlcv(source=None, extra=None):
-    cols = list(OHLCV_COLUMNS) + [c for c in (extra or ["source"]) if c not in OHLCV_COLUMNS]
+def empty_ohlcv(source=None, extra=None, error=None, issues=None):
+    cols = list(OHLCV_COLUMNS) + ["source", "is_outlier"]
+    if extra:
+        cols.extend(c for c in extra if c not in cols)
     df = pd.DataFrame(columns=cols)
-    return stamp_frame(df, source)
+    return stamp_frame(df, source, error=error, issues=issues)
 
 
-def empty_quotes(source=None):
-    return stamp_frame(pd.DataFrame(columns=QUOTE_COLUMNS), source)
+def empty_quotes(source=None, error=None, issues=None):
+    return stamp_frame(pd.DataFrame(columns=QUOTE_COLUMNS), source, error=error, issues=issues)
 
 
-def empty_list(source=None):
-    return stamp_frame(pd.DataFrame(columns=LIST_COLUMNS), source)
+def empty_list(source=None, error=None, issues=None):
+    return stamp_frame(pd.DataFrame(columns=LIST_COLUMNS), source, error=error, issues=issues)
 
 
-def empty_overview(source=None):
-    return stamp_frame(pd.DataFrame(columns=OVERVIEW_COLUMNS), source)
+def empty_overview(source=None, error=None, issues=None):
+    return stamp_frame(pd.DataFrame(columns=OVERVIEW_COLUMNS), source, error=error, issues=issues)
 
 
-def empty_index(source=None):
-    return stamp_frame(pd.DataFrame(columns=INDEX_COLUMNS), source)
+def empty_index(source=None, error=None, issues=None):
+    return stamp_frame(pd.DataFrame(columns=INDEX_COLUMNS), source, error=error, issues=issues)
 
 
-def empty_flow(source=None):
-    return stamp_frame(pd.DataFrame(columns=FLOW_COLUMNS), source)
+def empty_flow(source=None, error=None, issues=None):
+    return stamp_frame(pd.DataFrame(columns=FLOW_COLUMNS), source, error=error, issues=issues)
 
 
-def stamp_frame(df, source=None):
-    """给 DataFrame 打上来源与时区元数据。"""
+def stamp_frame(df, source=None, error=None, issues=None):
+    """给 DataFrame 打上来源、时区与失败原因。空表不把 source 写成标量以免弄坏 dtype。"""
     if df is None:
         df = pd.DataFrame()
-    if source and "source" in df.columns:
-        df["source"] = df["source"].fillna(source) if len(df) else source
-    elif source and not df.empty:
+    else:
         df = df.copy()
-        df["source"] = source
-    df.attrs["source"] = source or df.attrs.get("source")
+    if source:
+        if "source" not in df.columns:
+            df["source"] = pd.Series(source, index=df.index, dtype="object") if len(df) else pd.Series(dtype="object")
+        elif len(df):
+            df["source"] = df["source"].fillna(source)
+        df.attrs["source"] = source
+    else:
+        df.attrs["source"] = df.attrs.get("source")
     df.attrs["timezone"] = TZ_NAME
     df.attrs["fetched_at"] = datetime.now().isoformat(timespec="seconds")
+    if error:
+        df.attrs["error"] = error
+    if issues is not None:
+        df.attrs["issues"] = issues
     return df
 
 
@@ -171,9 +181,10 @@ def normalize_stock_code(code):
     text = text.replace(".SZ", "").replace(".SH", "").replace(".BJ", "")
     text = text.replace("XSHE", "").replace("XSHG", "")
     digits = re.sub(r"\D", "", text)
+    # 必须是 6 位，禁止把 "1" 补成 000001
     if len(digits) >= 6:
         return digits[-6:]
-    return digits.zfill(6) if digits else ""
+    return ""
 
 
 def to_ts_code(code):
@@ -295,9 +306,9 @@ def parse_dates(series):
             values = values.dt.tz_localize(None)
         return values.dt.normalize()
     text = pd.Series(values).astype(str).str.strip()
-    # 先尝试 YYYYMMDD
     compact = text.str.replace(r"\D", "", regex=True)
-    parsed = pd.to_datetime(compact, format="%Y%m%d", errors="coerce")
+    eight = compact.where(compact.str.len() < 8, compact.str.slice(0, 8))
+    parsed = pd.to_datetime(eight, format="%Y%m%d", errors="coerce")
     missing = parsed.isna()
     if missing.any():
         parsed.loc[missing] = pd.to_datetime(text[missing], errors="coerce")
@@ -374,49 +385,54 @@ def normalize_ohlcv(df, source=None, code=None, adjust=None):
 
 
 def clean_ohlcv(df, max_abs_return=1.0, drop_outliers=False):
-    """清洗空行、重复日期、非法 OHLC，并标记异常涨跌幅。"""
+    """清洗空行、重复日期、非法 OHLC，钳制 high/low，并标记异常涨跌幅。"""
+    source = None
+    if df is not None:
+        source = df.attrs.get("source") or (
+            df["source"].iloc[0] if "source" in df.columns and len(df) else None
+        )
     if df is None or df.empty:
-        return empty_ohlcv(getattr(df, "attrs", {}).get("source") if df is not None else None)
+        return empty_ohlcv(source, issues=["empty frame"])
 
     work = df.copy()
-    source = work.attrs.get("source") or (work["source"].iloc[0] if "source" in work.columns and len(work) else None)
-
-    work = work.dropna(subset=["date"])
-    if "close" in work.columns:
-        work = work[work["close"].notna()]
+    needed = [c for c in ("date", "open", "high", "low", "close") if c in work.columns]
+    work = work.dropna(subset=needed)
 
     for col in ("open", "high", "low", "close"):
         if col in work.columns:
             work = work[~(work[col] <= 0)]
 
-    if {"high", "low"}.issubset(work.columns):
-        swapped = work["high"] < work["low"]
-        if swapped.any():
-            high = work.loc[swapped, "high"].copy()
-            work.loc[swapped, "high"] = work.loc[swapped, "low"]
-            work.loc[swapped, "low"] = high
+    if {"open", "high", "low", "close"}.issubset(work.columns) and len(work):
+        highs = work[["open", "high", "low", "close"]].max(axis=1)
+        lows = work[["open", "high", "low", "close"]].min(axis=1)
+        work["high"] = highs
+        work["low"] = lows
 
     if "volume" in work.columns:
         work.loc[work["volume"] < 0, "volume"] = np.nan
         work["volume"] = work["volume"].fillna(0)
 
-    work = work.sort_values("date")
-    work = work.drop_duplicates(subset=["date"], keep="last")
+    if "date" in work.columns:
+        work = work.sort_values("date")
+        work = work.drop_duplicates(subset=["date"], keep="last")
 
     if "close" in work.columns and len(work) >= 2:
         ret = work["close"].pct_change().abs()
         work["is_outlier"] = ret > float(max_abs_return)
+        work["is_outlier"] = work["is_outlier"].fillna(False)
         if drop_outliers:
-            work = work[~work["is_outlier"] | work["is_outlier"].isna()]
+            work = work[~work["is_outlier"]]
     else:
         work["is_outlier"] = False
 
     work = work.reset_index(drop=True)
+    if work.empty:
+        return empty_ohlcv(source, issues=["all bars dropped by cleaner"])
     return stamp_frame(work, source)
 
 
-def validate_ohlcv(df):
-    """返回 (ok, issues)。空表视为不可用。"""
+def validate_ohlcv(df, min_bars=1):
+    """返回 (ok, issues)。空表、缺列、坏 bar、重复日期都算失败。"""
     issues = []
     if df is None or df.empty:
         return False, ["empty frame"]
@@ -425,12 +441,25 @@ def validate_ohlcv(df):
             issues.append(f"missing column: {col}")
     if issues:
         return False, issues
-    if df["date"].isna().all():
-        issues.append("all dates are NaT")
-    if df["close"].isna().all():
-        issues.append("all close values are NaN")
+    if df["date"].isna().any():
+        issues.append("null dates")
+    if df["close"].isna().any():
+        issues.append("null close")
+    for col in ("open", "high", "low", "close"):
+        bad = df[col].isna() | (df[col] <= 0)
+        if bad.any():
+            issues.append(f"invalid {col}")
+    if (df["high"] < df["low"]).any():
+        issues.append("high < low")
+    outside = (df["close"] > df["high"]) | (df["close"] < df["low"])
+    if outside.any():
+        issues.append("close outside high/low")
     if len(df) != df["date"].nunique():
         issues.append("duplicate dates remain")
+    if not df["date"].is_monotonic_increasing:
+        issues.append("dates not sorted")
+    if len(df) < int(min_bars):
+        issues.append(f"fewer than {min_bars} bars")
     return len(issues) == 0, issues
 
 
@@ -478,8 +507,7 @@ def normalize_quotes(df, source=None, market_cap_unit="yuan"):
         work["source"] = source
 
     keep = [c for c in QUOTE_COLUMNS if c in work.columns]
-    extras = [c for c in work.columns if c not in keep]
-    work = work[keep + extras]
+    work = work[keep]
     return stamp_frame(work, source)
 
 
@@ -489,7 +517,7 @@ def normalize_stock_list(df, source=None):
     work = rename_columns(df.copy())
     if "code" in work.columns:
         work["code"] = work["code"].map(normalize_stock_code)
-        work["exchange"] = work.get("exchange", work["code"].map(infer_exchange))
+        work["exchange"] = work["code"].map(infer_exchange)
         names = work["name"] if "name" in work.columns else pd.Series([""] * len(work))
         if "board" not in work.columns:
             work["board"] = [
@@ -500,8 +528,126 @@ def normalize_stock_list(df, source=None):
     if source:
         work["source"] = source
     keep = [c for c in LIST_COLUMNS if c in work.columns]
-    extras = [c for c in work.columns if c not in keep]
-    return stamp_frame(work[keep + extras], source)
+    quote_extras = [c for c in QUOTE_COLUMNS if c in work.columns and c not in keep]
+    return stamp_frame(work[keep + quote_extras], source)
+
+
+def compact_date(value):
+    """任意日期 → YYYYMMDD 字符串；空值返回空串。"""
+    if value is None or value == "":
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y%m%d")
+    digits = "".join(ch for ch in str(value).strip() if ch.isdigit())
+    return digits[:8] if len(digits) >= 8 else digits
+
+
+def normalize_period(period):
+    mapping = {
+        "daily": "daily",
+        "d": "daily",
+        "日线": "daily",
+        "日": "daily",
+        "weekly": "weekly",
+        "w": "weekly",
+        "周线": "weekly",
+        "周": "weekly",
+        "monthly": "monthly",
+        "m": "monthly",
+        "月线": "monthly",
+        "月": "monthly",
+    }
+    if period is None:
+        return "daily"
+    text = str(period).strip()
+    return mapping.get(text.lower(), mapping.get(text, "daily"))
+
+
+def normalize_adjust(adjust):
+    if adjust is None:
+        return ""
+    text = str(adjust).strip()
+    mapping = {
+        "": "",
+        "none": "",
+        "raw": "",
+        "nadj": "",
+        "qfq": "qfq",
+        "hfq": "hfq",
+        "前复权": "qfq",
+        "后复权": "hfq",
+        "不复权": "",
+    }
+    return mapping.get(text, mapping.get(text.lower(), text))
+
+
+def filter_date_range(df, start=None, end=None):
+    if df is None or df.empty or "date" not in df.columns:
+        return df
+    work = df
+    start_key = compact_date(start)
+    end_key = compact_date(end)
+    if start_key:
+        start_ts = pd.to_datetime(start_key, format="%Y%m%d", errors="coerce")
+        if pd.notna(start_ts):
+            work = work[work["date"] >= start_ts]
+    if end_key:
+        end_ts = pd.to_datetime(end_key, format="%Y%m%d", errors="coerce")
+        if pd.notna(end_ts):
+            work = work[work["date"] <= end_ts]
+    return work.reset_index(drop=True) if work is not df else work
+
+
+def enforce_ohlcv_schema(df, source=None):
+    """保证返回列齐全、顺序稳定，丢掉未知列。"""
+    if df is None:
+        df = pd.DataFrame()
+    work = df.copy()
+    for col in OHLCV_COLUMNS:
+        if col not in work.columns:
+            work[col] = pd.NaT if col == "date" else pd.Series(dtype="float64")
+    if "is_outlier" not in work.columns:
+        work["is_outlier"] = False
+    if source and "source" not in work.columns and len(work):
+        work["source"] = source
+    ordered = [c for c in OHLCV_COLUMNS + OHLCV_OPTIONAL if c in work.columns]
+    return stamp_frame(work[ordered], source or work.attrs.get("source"))
+
+
+def prepare_ohlcv(
+    df,
+    source=None,
+    code=None,
+    adjust=None,
+    start=None,
+    end=None,
+    max_abs_return=1.0,
+    drop_outliers=False,
+    error=None,
+):
+    """适配器共用：标准化 → 清洗 → 日期裁剪 → 校验，失败原因写进 attrs。"""
+    if code is not None and not normalize_stock_code(code):
+        return empty_ohlcv(
+            source,
+            error=error or f"invalid stock code: {code!r}",
+            issues=["invalid stock code"],
+        )
+    work = normalize_ohlcv(df, source=source, code=code, adjust=adjust)
+    work = clean_ohlcv(
+        work,
+        max_abs_return=max_abs_return,
+        drop_outliers=drop_outliers,
+    )
+    work = filter_date_range(work, start, end)
+    work = enforce_ohlcv_schema(work, source=source)
+    ok, issues = validate_ohlcv(work)
+    work.attrs["ok"] = ok
+    work.attrs["issues"] = issues
+    if error:
+        work.attrs["error"] = error
+    if not ok and work.empty:
+        return empty_ohlcv(source, error=error, issues=issues)
+    return work
 
 
 def attach_meta(df, **meta):

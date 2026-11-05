@@ -104,7 +104,7 @@ if analyze_btn or 'analyze' in st.session_state:
         st.session_state.analyze = True
     
     try:
-        from src.data.akshare_data import AKShareData
+        from src.data import get_data_source
         from src.analysis.trading_signals import TradingSignalAnalyzer
         from src.analysis.trading_signals_optimized import OptimizedTradingSignalAnalyzer
         from src.analysis.advanced_trading import AdvancedTradingAnalyzer
@@ -113,7 +113,9 @@ if analyze_btn or 'analyze' in st.session_state:
         
         # 获取数据
         with st.spinner("正在获取数据..."):
-            ak_data = AKShareData()
+            ak_data = get_data_source(st.session_state.get("data_source", "akshare"))
+            if not ak_data.is_available():
+                ak_data = get_data_source("akshare")
             
             end_date = datetime.now()
             start_date = end_date - timedelta(days=period)
@@ -454,7 +456,14 @@ if analyze_btn or 'analyze' in st.session_state:
             
         else:
             st.error(f"❌ 未能获取股票 {stock_code} 的数据")
-            st.info("💡 提示：请检查股票代码是否正确")
+            if hist_data is not None:
+                issues = hist_data.attrs.get("issues") or []
+                err = hist_data.attrs.get("error")
+                if err:
+                    st.caption(f"原因: {err}")
+                if issues:
+                    st.caption("校验: " + ", ".join(issues))
+            st.info("💡 提示：请检查股票代码是否为 6 位数字")
     
     except Exception as e:
         st.error(f"❌ 分析过程中发生错误: {str(e)}")

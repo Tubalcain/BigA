@@ -12,16 +12,20 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 
 from src.data.cache import TTLCache, make_cache_key
-from src.data.fetch import RateLimitError, is_rate_limited, with_retry
+from src.data.fetch import DataFetchError, RateLimitError, call_with_timeout, is_rate_limited, with_retry
 from src.data.config import get_data_config, load_app_config
 from src.data.quality import (
     clean_ohlcv,
+    compact_date,
     infer_board,
     infer_exchange,
     match_exchange,
+    normalize_adjust,
     normalize_ohlcv,
+    normalize_period,
     normalize_quotes,
     normalize_stock_code,
+    prepare_ohlcv,
     to_ts_code,
     validate_ohlcv,
 )
@@ -41,6 +45,12 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(match_exchange("000001", "深圳交易所"))
         self.assertFalse(match_exchange("000001", "上海交易所"))
         self.assertTrue(match_exchange("000001", "所有"))
+        self.assertEqual(normalize_stock_code("1"), "")
+        self.assertEqual(normalize_stock_code("00001"), "")
+        self.assertEqual(to_ts_code("1"), "")
+        self.assertEqual(compact_date("2024-01-02"), "20240102")
+        self.assertEqual(normalize_period("周线"), "weekly")
+        self.assertEqual(normalize_adjust("前复权"), "qfq")
 
     def test_normalize_chinese_ohlcv(self):
         raw = pd.DataFrame(
@@ -62,6 +72,8 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(df.attrs.get("timezone"), "Asia/Shanghai")
         last = df.iloc[-1]
         self.assertGreaterEqual(last["high"], last["low"])
+        self.assertGreaterEqual(last["high"], last["close"])
+        self.assertLessEqual(last["low"], last["close"])
 
     def test_outlier_flag(self):
         raw = pd.DataFrame(
@@ -86,12 +98,53 @@ class QualityTests(unittest.TestCase):
                 "涨跌幅": [1.5],
                 "成交量": [10000],
                 "总市值": [1_000_000_000],  # 元
+                "买入": [12.2],
             }
         )
         quotes = normalize_quotes(raw, source="akshare", market_cap_unit="yuan")
         self.assertAlmostEqual(quotes.iloc[0]["market_cap"], 100000.0)
         self.assertEqual(quotes.iloc[0]["price"], 12.3)
         self.assertEqual(quotes.iloc[0]["exchange"], "深圳交易所")
+        self.assertNotIn("买入", quotes.columns)
+
+    def test_short_code_does_not_pad_to_pingan(self):
+        df = prepare_ohlcv(pd.DataFrame(), source="test", code="1")
+        self.assertTrue(df.empty)
+        self.assertIn("invalid stock code", df.attrs.get("issues", []))
+
+    def test_prepare_ohlcv_filters_dates_and_reports_issues(self):
+        raw = pd.DataFrame(
+            {
+                "date": ["20240101", "20240102", "20240103", "20240105"],
+                "open": [10, 10, 10, 10],
+                "high": [11, 11, 11, 11],
+                "low": [9, 9, 9, 9],
+                "close": [10, 10.2, 10.1, 10.3],
+                "volume": [1, 1, 1, 1],
+                "junk": [1, 2, 3, 4],
+            }
+        )
+        df = prepare_ohlcv(raw, source="test", code="000001", start="20240102", end="20240103")
+        self.assertTrue(df.attrs.get("ok"))
+        self.assertEqual(len(df), 2)
+        self.assertNotIn("junk", df.columns)
+        self.assertEqual(df["date"].min(), pd.Timestamp("2024-01-02"))
+        self.assertEqual(df["date"].max(), pd.Timestamp("2024-01-03"))
+
+    def test_validate_detects_dirty_bars(self):
+        dirty = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2024-01-03", "2024-01-01", "2024-01-01"]),
+                "open": [10, 10, 10],
+                "high": [9, 11, 11],
+                "low": [11, 9, 9],
+                "close": [12, 10, 10],
+                "volume": [1, 1, 1],
+            }
+        )
+        ok, issues = validate_ohlcv(dirty)
+        self.assertFalse(ok)
+        self.assertTrue(any("high < low" in i or "duplicate" in i or "sorted" in i or "outside" in i for i in issues))
 
 
 class CacheConfigTests(unittest.TestCase):
@@ -138,6 +191,34 @@ class CacheConfigTests(unittest.TestCase):
         with self.assertRaises(RateLimitError):
             with_retry(boom, retries=4, timeout=0, delay=0)
         self.assertEqual(calls["n"], 1)
+
+    def test_timeout_returns_without_waiting_for_worker(self):
+        import time
+
+        def slow():
+            time.sleep(2)
+            return "done"
+
+        started = time.monotonic()
+        with self.assertRaises(DataFetchError):
+            call_with_timeout(slow, 0.2)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_get_data_source_does_not_silently_swap(self):
+        from src.data import get_data_source
+        from src.data.akshare_data import AKShareData
+        from src.data.tushare_data import TuShareData
+
+        os.environ.pop("TUSHARE_TOKEN", None)
+        load_app_config.cache_clear()
+        get_data_config(reload=True)
+        ak = get_data_source("akshare")
+        ts = get_data_source("tushare")
+        self.assertIsInstance(ak, AKShareData)
+        self.assertEqual(ak.name, "akshare")
+        self.assertIsInstance(ts, TuShareData)
+        self.assertEqual(ts.name, "tushare")
+        self.assertFalse(ts.is_available())
 
     def test_tushare_unavailable_without_token(self):
         from src.data.tushare_data import TuShareData

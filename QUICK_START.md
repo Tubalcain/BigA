@@ -114,7 +114,7 @@ python examples/test_data_source.py
 ## 常见问题
 
 ### Q: 获取数据失败？
-A: 检查网络连接，确保可以访问AKShare或TuShare服务器。
+A: 检查网络连接，确保可以访问AKShare或TuShare服务器。页面会显示 `issues`（例如代码不是 6 位）。工厂函数是 `get_data_source("akshare"|"tushare")`，不要把短代码当成 000001。
 
 ### Q: TuShare token如何获取？
 A: 访问 https://tushare.pro 注册并获取token。

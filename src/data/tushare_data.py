@@ -16,8 +16,7 @@ from .cache import get_cache, make_cache_key
 from .config import get_data_config
 from .fetch import DataFetchError, safe_fetch
 from .quality import (
-    attach_meta,
-    clean_ohlcv,
+    compact_date,
     empty_flow,
     empty_index,
     empty_list,
@@ -26,10 +25,12 @@ from .quality import (
     empty_quotes,
     infer_limit_pct,
     match_exchange,
-    normalize_ohlcv,
+    normalize_adjust,
+    normalize_period,
     normalize_quotes,
     normalize_stock_code,
     normalize_stock_list,
+    prepare_ohlcv,
     stamp_frame,
     to_numeric,
     to_ts_code,
@@ -40,6 +41,8 @@ logger = logging.getLogger("biga.data.tushare")
 
 
 class TuShareData:
+    name = "tushare"
+
     def __init__(self, config=None):
         self.config = config or get_data_config()
         self.source_cfg = self.config.tushare
@@ -142,43 +145,60 @@ class TuShareData:
         if not self.is_available():
             if allow_fallback:
                 fallback = self._fallback_history(stock_code, start_date, end_date, period, adjust)
-                if fallback is not None:
+                if fallback is not None and validate_ohlcv(fallback)[0]:
                     return fallback
-            return empty_ohlcv("tushare")
+            return empty_ohlcv(
+                "tushare",
+                error="tushare unavailable",
+                issues=["tushare unavailable"],
+            )
         df = self.get_daily_data(stock_code, start_date, end_date, period=period, adjust=adjust)
-        ok, _ = validate_ohlcv(df)
+        ok, issues = validate_ohlcv(df)
         if not ok and allow_fallback:
             fallback = self._fallback_history(stock_code, start_date, end_date, period, adjust)
-            if fallback is not None:
+            if fallback is not None and validate_ohlcv(fallback)[0]:
                 return fallback
+        if not ok:
+            df.attrs["issues"] = issues
         return df
 
     def get_daily_data(self, stock_code, start_date, end_date, period="daily", adjust=None):
         """TuShare 日/周/月线，标准化为 OHLCV。"""
         code = normalize_stock_code(stock_code)
         ts_code = to_ts_code(code)
-        start = _compact_date(start_date)
-        end = _compact_date(end_date)
-        period_key = _normalize_period(period)
-        adj = _normalize_adjust(adjust if adjust is not None else self.config.akshare.adjust)
+        start = compact_date(start_date)
+        end = compact_date(end_date)
+        period_key = normalize_period(period)
+        adj = normalize_adjust(adjust if adjust is not None else self.config.akshare.adjust)
+        if not code:
+            return empty_ohlcv(
+                "tushare",
+                error=f"invalid stock code: {stock_code!r}",
+                issues=["invalid stock code"],
+            )
 
         def loader():
             if not self.is_available():
-                return empty_ohlcv("tushare")
+                return empty_ohlcv("tushare", issues=["tushare unavailable"])
             raw = self._fetch_bars(ts_code, start, end, period_key, adj)
             if raw is None or raw.empty:
-                return empty_ohlcv("tushare")
-            # TuShare amount 单位：千元
-            if "amount" in raw.columns:
-                raw = raw.copy()
-                raw["amount"] = to_numeric(raw["amount"]) * 1000
-            df = normalize_ohlcv(raw, source="tushare", code=code, adjust=adj)
-            df = clean_ohlcv(
-                df,
+                return empty_ohlcv("tushare", error="upstream empty", issues=["empty frame"])
+            work = raw.copy()
+            if "amount" in work.columns:
+                work["amount"] = to_numeric(work["amount"]) * 1000
+            df = prepare_ohlcv(
+                work,
+                source="tushare",
+                code=code,
+                adjust=adj,
+                start=start,
+                end=end,
                 max_abs_return=self.config.quality_max_abs_return,
                 drop_outliers=self.config.drop_outlier_bars,
             )
-            return attach_meta(df, period=period_key, code=code)
+            df.attrs["period"] = period_key
+            df.attrs["code"] = code
+            return df
 
         return self._cached(
             ("daily", ts_code, start, end, period_key, adj),
@@ -222,8 +242,8 @@ class TuShareData:
         if not self.is_available():
             return stamp_frame(pd.DataFrame(), "tushare")
         ts_code = to_ts_code(stock_code)
-        start = _compact_date(start_date)
-        end = _compact_date(end_date)
+        start = compact_date(start_date)
+        end = compact_date(end_date)
 
         def loader():
             raw = self._fetch(
@@ -374,9 +394,9 @@ class TuShareData:
 
         return self._cached(("quote", code), self.ttl_realtime, loader, empty_quotes("tushare"))
 
-    def get_market_overview(self):
-        """用最近交易日 daily 全市场涨跌估算。积分不足时返回空表。"""
-        if not self.is_available():
+    def get_market_overview(self, light=False):
+        """用最近交易日 daily 全市场涨跌估算。light=True 时跳过重查询。"""
+        if light or not self.is_available():
             return empty_overview("tushare")
 
         def loader():
@@ -504,8 +524,8 @@ class TuShareData:
         return self.get_fund_flow()
 
     def get_trade_calendar(self, start_date=None, end_date=None):
-        start = _compact_date(start_date) or (pd.Timestamp.now() - pd.Timedelta(days=365)).strftime("%Y%m%d")
-        end = _compact_date(end_date) or (pd.Timestamp.now() + pd.Timedelta(days=30)).strftime("%Y%m%d")
+        start = compact_date(start_date) or (pd.Timestamp.now() - pd.Timedelta(days=365)).strftime("%Y%m%d")
+        end = compact_date(end_date) or (pd.Timestamp.now() + pd.Timedelta(days=30)).strftime("%Y%m%d")
 
         def loader():
             if not self.is_available():
@@ -576,36 +596,3 @@ class TuShareData:
         return opened.iloc[-1]["date"].strftime("%Y%m%d")
 
 
-def _compact_date(value):
-    if value is None or value == "":
-        return ""
-    if hasattr(value, "strftime"):
-        return value.strftime("%Y%m%d")
-    text = str(value).strip()
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits[:8] if digits else ""
-
-
-def _normalize_period(period):
-    mapping = {
-        "daily": "daily",
-        "d": "daily",
-        "日线": "daily",
-        "weekly": "weekly",
-        "w": "weekly",
-        "周线": "weekly",
-        "monthly": "monthly",
-        "m": "monthly",
-        "月线": "monthly",
-    }
-    if period is None:
-        return "daily"
-    return mapping.get(str(period).strip().lower(), mapping.get(str(period).strip(), "daily"))
-
-
-def _normalize_adjust(adjust):
-    if not adjust:
-        return ""
-    text = str(adjust).strip().lower()
-    mapping = {"qfq": "qfq", "hfq": "hfq", "前复权": "qfq", "后复权": "hfq"}
-    return mapping.get(text, mapping.get(str(adjust).strip(), ""))

@@ -68,40 +68,23 @@ if analyze_btn or 'show_analysis' in st.session_state:
     
     # 获取股票基本信息
     try:
-        from src.data.akshare_data import AKShareData
-        from src.data.tushare_data import TuShareData
+        from src.data import get_data_source
         from src.analysis.technical import TechnicalAnalyzer
         from src.visualization.charts import PlotlyChartGenerator
         
-        # 选择数据源
-        if data_source == "AKShare":
-            data_obj = AKShareData()
-        else:
-            data_obj = TuShareData()
-            if not data_obj.is_available():
-                st.warning("TuShare未配置，切换为AKShare")
-                data_obj = AKShareData()
-                data_source = "AKShare"
+        preferred = "akshare" if data_source == "AKShare" else "tushare"
+        data_obj = get_data_source(preferred)
+        if preferred == "tushare" and not data_obj.is_available():
+            st.warning("TuShare未配置，切换为AKShare")
+            data_obj = get_data_source("akshare")
+            data_source = "AKShare"
         
         with st.spinner("正在获取数据..."):
-            # 获取历史数据（适配器会在主源失败时按配置回退）
             hist_data = data_obj.get_history_data(
                 stock_code,
                 start_date.strftime('%Y%m%d'),
                 end_date.strftime('%Y%m%d')
             )
-            if (hist_data is None or hist_data.empty) and data_source == "AKShare":
-                from src.data.tushare_data import TuShareData as _TS
-                ts_client = _TS()
-                if ts_client.is_available():
-                    st.info("AKShare 无数据，正在尝试 TuShare…")
-                    hist_data = ts_client.get_history_data(
-                        stock_code,
-                        start_date.strftime('%Y%m%d'),
-                        end_date.strftime('%Y%m%d'),
-                    )
-                    if hist_data is not None and not hist_data.empty:
-                        data_source = "TuShare"
         
         # 调试信息
         if not hist_data.empty:
@@ -109,6 +92,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
             st.success(f"✓ 成功获取 {len(hist_data)} 条数据（来源: {used_source}）")
             with st.expander("🔍 调试信息（点击查看数据列名）"):
                 st.write("数据列名:", list(hist_data.columns))
+                st.write("attrs:", {k: hist_data.attrs.get(k) for k in ("source", "timezone", "issues", "ok")})
                 st.write("前5行数据:")
                 st.dataframe(hist_data.head())
         
@@ -193,6 +177,13 @@ if analyze_btn or 'show_analysis' in st.session_state:
             
         else:
             st.error(f"❌ 未能获取股票 {stock_code} 的数据")
+            if hist_data is not None:
+                err = hist_data.attrs.get("error")
+                issues = hist_data.attrs.get("issues")
+                if err:
+                    st.caption(f"原因: {err}")
+                if issues:
+                    st.caption("校验: " + ", ".join(issues))
             
             with st.expander("🆘 可能的原因和解决方案"):
                 st.markdown("""
