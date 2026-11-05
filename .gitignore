@@ -40,10 +40,12 @@ env/
 .env
 
 # Data
-data/
+data/*
+!data/.gitkeep
 *.csv
 *.xlsx
 *.json
+!config/*.yaml
 
 # Streamlit
 .streamlit/

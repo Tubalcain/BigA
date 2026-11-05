@@ -168,5 +168,5 @@ else:
 
 # 页脚
 st.markdown("---")
-st.caption("数据来源: AKShare | 投资有风险，入市需谨慎")
+st.caption("数据来源: AKShare / TuShare 回退 | 投资有风险，入市需谨慎")
 

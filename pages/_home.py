@@ -3,6 +3,7 @@
 """
 
 import streamlit as st
+import pandas as pd
 
 st.set_page_config(page_title="首页", page_icon="🏠", layout="wide")
 
@@ -13,7 +14,7 @@ st.markdown("---")
 st.info("""
 欢迎使用大A股数据分析工具！
 
-本应用基于OpenBB框架，集成AKShare和TuShare数据源，为投资者提供专业的A股数据分析服务。
+本应用使用 AKShare（默认）和可选的 TuShare 数据源，为投资者提供 A 股行情、技术分析和组合跟踪。OpenBB 未接入。
 """)
 
 # 功能导航
@@ -50,17 +51,42 @@ st.subheader("📊 市场概况")
 
 try:
     from src.data.akshare_data import AKShareData
-    
+
     ak_data = AKShareData()
-    overview = ak_data.get_market_overview()
-    
-    if not overview.empty:
-        col1, col2, col3, col4 = st.columns(4)
-        
-        col1.metric("上证指数", "3,000", "+0.5%")
-        col2.metric("深证成指", "10,000", "-0.3%")
-        col3.metric("创业板指", "2,000", "+1.2%")
-        col4.metric("上涨股票", "1,500", "45%")
-except:
+    # 首页只拉指数，避免每次打开都打全市场快照（易限流、很慢）
+    indices = ak_data.get_index_quotes()
+    overview = ak_data.get_market_overview(light=True)
+
+    col1, col2, col3, col4 = st.columns(4)
+    shown = False
+
+    def _index_metric(column, keyword, label):
+        if indices is None or indices.empty or "name" not in indices.columns:
+            return False
+        row = indices[indices["name"].astype(str).str.contains(keyword, na=False)]
+        if row.empty:
+            return False
+        item = row.iloc[0]
+        price = item.get("price")
+        chg = item.get("change_pct")
+        delta = f"{chg:+.2f}%" if pd.notna(chg) else None
+        column.metric(label, f"{float(price):,.2f}" if pd.notna(price) else "-", delta)
+        return True
+
+    shown |= _index_metric(col1, "上证", "上证指数")
+    shown |= _index_metric(col2, "深证", "深证成指")
+    shown |= _index_metric(col3, "创业板", "创业板指")
+
+    if overview is not None and not overview.empty and {"type", "count"}.issubset(overview.columns):
+        up = overview.loc[overview["type"] == "上涨", "count"]
+        if not up.empty:
+            col4.metric("上涨股票", f"{int(up.iloc[0]):,}")
+            shown = True
+        source = overview.attrs.get("source") or "akshare"
+        st.caption(f"数据来源: {source}")
+    if not shown:
+        st.info("市场快照暂不可用，请检查网络后刷新。")
+except Exception as exc:
     st.info("正在加载市场数据...")
+    st.caption(str(exc))
 

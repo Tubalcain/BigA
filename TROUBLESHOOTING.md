@@ -109,17 +109,19 @@ Address already in use
    streamlit run app.py --server.port 8502
    ```
 
-### 问题7：数据获取失败
+### 问题7：数据获取失败 / `ModuleNotFoundError: src.data`
 **错误信息**：
 ```
 Failed to fetch data from AKShare
+ModuleNotFoundError: No module named 'src.data'
 ```
 
 **解决方案**：
-1. 检查网络连接
-2. AKShare服务器可能暂时不可用，稍后重试
-3. 可以配置TuShare作为备选数据源
-4. 尝试使用推荐的股票代码：000001, 600519
+1. 确认仓库包含 `src/data/akshare_data.py` 与 `src/data/tushare_data.py`（从项目根目录运行）
+2. 检查网络，确认能访问东财/新浪或 TuShare
+3. 设置 `TUSHARE_TOKEN` 后可自动回退
+4. 运行 `python examples/test_data_source.py` 看是哪一层失败
+5. 热门代码：000001, 000002, 600519, 600000
 
 ### 问题8：缺少必要的列（open, close等）
 **错误信息**：
@@ -130,12 +132,14 @@ Failed to fetch data from AKShare
 **原因**：AKShare返回的列名可能是中文，需要映射
 
 **解决方案**：
-已自动修复！代码现在会自动将中文列名映射为英文：
+`src/data/quality.py` 会把常见中英列名映射为英文，并做类型转换：
 - `开盘` → `open`
 - `收盘` → `close`
 - `最高` → `high`
 - `最低` → `low`
 - `成交量` → `volume`
+
+若仍缺列，展开「调试信息」查看原始列名，或升级 AKShare：`pip install -U akshare`。
 
 ### 问题9：AKShare API兼容性问题
 **错误信息**：
@@ -150,6 +154,7 @@ stock_zh_a_hist 失败: '前复权'
    ```
 2. 代码已自动适配，尝试多种API调用方式
 3. 如果仍失败，使用推荐股票代码：000001, 000002, 600519
+4. 适配器会依次尝试 `adjust=""` / 不传 adjust / 不传日期，再回退 TuShare
 
 ### 问题10：某些股票无法获取数据
 **错误信息**：
@@ -166,6 +171,22 @@ stock_zh_a_hist 失败: '前复权'
 1. 使用推荐的热门股票代码测试
 2. 检查股票代码是否为6位数字
 3. 查看应用中的"调试信息"了解详情
+
+### 问题11：TuShare 提示未配置
+**原因**：YAML 里 token 为空，且没有 `TUSHARE_TOKEN`。
+
+**解决方案**：
+```bash
+export TUSHARE_TOKEN=your_token_here   # Windows: set TUSHARE_TOKEN=...
+python examples/test_data_source.py
+```
+不要把真实 token 写进 `config/config.yaml` 后提交。
+
+### 问题12：东方财富提示「IP 被临时限流」
+全市场快照 `stock_zh_a_spot_em` 分页多，短时间重复请求会被封 5–40 分钟。适配器**不会对限流再重试**，并回退到新浪 `stock_zh_a_spot`。等待恢复期间不要循环点「开始筛选」。
+
+### 问题13：周末或停牌看不到实时价
+适配器会用最近一根 K 线收盘价兜底；`status=halted` 表示停牌。交易日历见 `get_trade_calendar()`。
 
 ## 快速诊断命令
 

@@ -84,16 +84,29 @@ if analyze_btn or 'show_analysis' in st.session_state:
                 data_source = "AKShare"
         
         with st.spinner("正在获取数据..."):
-            # 获取历史数据
+            # 获取历史数据（适配器会在主源失败时按配置回退）
             hist_data = data_obj.get_history_data(
                 stock_code,
                 start_date.strftime('%Y%m%d'),
                 end_date.strftime('%Y%m%d')
             )
+            if (hist_data is None or hist_data.empty) and data_source == "AKShare":
+                from src.data.tushare_data import TuShareData as _TS
+                ts_client = _TS()
+                if ts_client.is_available():
+                    st.info("AKShare 无数据，正在尝试 TuShare…")
+                    hist_data = ts_client.get_history_data(
+                        stock_code,
+                        start_date.strftime('%Y%m%d'),
+                        end_date.strftime('%Y%m%d'),
+                    )
+                    if hist_data is not None and not hist_data.empty:
+                        data_source = "TuShare"
         
         # 调试信息
         if not hist_data.empty:
-            st.success(f"✓ 成功获取 {len(hist_data)} 条数据")
+            used_source = hist_data.attrs.get("source") or data_source
+            st.success(f"✓ 成功获取 {len(hist_data)} 条数据（来源: {used_source}）")
             with st.expander("🔍 调试信息（点击查看数据列名）"):
                 st.write("数据列名:", list(hist_data.columns))
                 st.write("前5行数据:")
@@ -199,7 +212,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
                 - 稍后再试
                 
                 ### 测试数据源：
-                可以运行 `python test_stock.py` 来测试数据源是否可用
+                可以运行 `python examples/test_data_source.py` 来测试数据源是否可用
                 """)
     
     except Exception as e:
@@ -214,7 +227,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
         1. 检查股票代码格式是否正确（6位数字）
         2. 尝试使用其他数据源（AKShare/TuShare）
         3. 稍后重试
-        4. 运行测试脚本：`python test_stock.py`
+        4. 运行测试脚本：`python examples/test_data_source.py`
         """)
 
 else:
@@ -258,5 +271,5 @@ indicators = ["MA", "MACD", "RSI"]
 
 # 页脚
 st.markdown("---")
-st.caption("数据来源: AKShare / TuShare | 更新时间: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+st.caption("数据来源: AKShare / TuShare（可回退） | 更新时间: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 

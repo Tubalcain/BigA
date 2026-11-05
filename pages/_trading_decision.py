@@ -118,10 +118,12 @@ if analyze_btn or 'analyze' in st.session_state:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=period)
             
+            period_map = {"日线": "daily", "周线": "weekly", "月线": "monthly"}
             hist_data = ak_data.get_history_data(
                 stock_code,
                 start_date.strftime('%Y%m%d'),
-                end_date.strftime('%Y%m%d')
+                end_date.strftime('%Y%m%d'),
+                period=period_map.get(time_frame, "daily"),
             )
         
         if not hist_data.empty:

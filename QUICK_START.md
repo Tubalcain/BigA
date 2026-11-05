@@ -10,7 +10,7 @@
 
 **编码问题修复**：已修复Windows控制台中文乱码问题，现在可以正常显示中文。
 
-如果仍遇到乱码，请参考 [ENCODING_FIX.md](ENCODING_FIX.md) 文件。
+如果仍遇到乱码，在启动前执行 `chcp 65001` 并设置 `PYTHONIOENCODING=utf-8`。
 
 ### Linux/Mac用户
 运行启动脚本：
@@ -61,12 +61,13 @@ streamlit run app.py
 ## 配置数据源
 
 ### AKShare（推荐，无需注册）
-AKShare已默认启用，可以直接使用。
+AKShare 已默认启用。实现位于 `src/data/akshare_data.py`。
 
 ### TuShare（可选，需注册）
-1. 访问 https://tushare.pro 注册账号
-2. 获取Token
-3. 设置环境变量：
+1. 访问 https://tushare.pro 注册账号并取得 token  
+2. **不要把真实 token 提交到 git**  
+3. 用环境变量或本地 `.env`（可从 `.env.example` 复制）：
+
 ```bash
 # Windows
 set TUSHARE_TOKEN=your_token_here
@@ -75,7 +76,8 @@ set TUSHARE_TOKEN=your_token_here
 export TUSHARE_TOKEN=your_token_here
 ```
 
-或在 `config/config.yaml` 中配置。
+`config/config.yaml` 里的 `tushare.token` 请保持为空；环境变量优先。
+主源失败时默认回退到另一源（`data_sources.fallback: true`）。
 
 ## 使用示例
 
@@ -102,6 +104,10 @@ export TUSHARE_TOKEN=your_token_here
 运行测试脚本检查数据源是否正常：
 
 ```bash
+# 离线：schema / 缓存 / 配置
+python -m unittest tests.test_data_quality
+
+# 在线冒烟：AKShare 必测，TuShare 无 token 则跳过
 python examples/test_data_source.py
 ```
 
@@ -121,7 +127,7 @@ A: 参考 `examples/` 目录下的示例代码。
 - **UI框架**: Streamlit
 - **数据源**: AKShare + TuShare  
 - **可视化**: Plotly
-- **分析框架**: OpenBB (参考)
+- **分析模块**: 自研（`src/analysis`）；OpenBB 未集成
 
 ## 许可证
 

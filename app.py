@@ -1,6 +1,6 @@
 """
 BigA Stock Analysis - 大A股数据分析应用
-基于OpenBB框架，集成AKShare和TuShare数据源
+集成 AKShare（默认）与 TuShare（可选）数据源，OpenBB 未接入
 主应用文件
 """
 
@@ -92,8 +92,8 @@ with st.sidebar:
     **BigA Stock Analysis**  
     版本: v1.0.0  
     
-    基于OpenBB框架  
-    数据源: AKShare + TuShare
+    数据源: AKShare + TuShare（可选）  
+    OpenBB: 未集成（可选未来扩展）
     
     [GitHub](https://github.com) | 
     [文档](https://github.com)
@@ -189,7 +189,7 @@ show_home()
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666;'>
-    <p>BigA Stock Analysis © 2024 | Powered by Streamlit + OpenBB</p>
+    <p>BigA Stock Analysis © 2024 | Powered by Streamlit + AKShare/TuShare</p>
 </div>
 """, unsafe_allow_html=True)
 
