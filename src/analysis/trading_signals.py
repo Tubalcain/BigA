@@ -235,8 +235,8 @@ class TradingSignalAnalyzer:
             'distance_to_resistance': ((resistance - current) / current * 100) if current > 0 else 0
         }
     
-    def get_trading_recommendation(self):
-        """综合交易建议"""
+    def get_trading_recommendation(self, fund_flow_bias=None):
+        """综合交易建议。fund_flow_bias 为可选资金面倾向，只做软评分。"""
         # 分析技术信号
         signals = self.analyze_technical_signals()
         
@@ -277,7 +277,7 @@ class TradingSignalAnalyzer:
             action = 'SELL'
             confidence = '高'
         
-        return {
+        rec = {
             'recommendation': recommendation,
             'action': action,
             'confidence': confidence,
@@ -288,6 +288,13 @@ class TradingSignalAnalyzer:
             'support_resistance': levels,
             'signals': signals
         }
+        if fund_flow_bias is not None:
+            from src.analysis.fund_flow import apply_fund_flow_bias
+
+            rec = apply_fund_flow_bias(
+                rec, fund_flow_bias, strong_buy=8, buy=4, hold_floor=0, sell_floor=-4
+            )
+        return rec
     
     def get_risk_assessment(self):
         """风险评估"""

@@ -48,6 +48,20 @@ def _show_empty(frame, fallback="接口暂时不可用（源站限流、字段�
         st.caption(reason)
 
 
+def _render_fund_bias_card(bias):
+    from src.analysis.fund_flow import bias_display
+
+    view = bias_display(bias)
+    st.markdown(f"#### {view['title']}")
+    st.caption(view["disclaimer"])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("倾向", view["bias"])
+    c2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
+    c3.metric("软评分", view["score_delta"])
+    for line in view["evidence"][:8]:
+        st.caption("· " + line)
+
+
 def _flow_table(df, extra=None, rows=20):
     cols = ["code", "name", "net_inflow", "main_net_inflow", "super_large_net", "large_net", "small_net", "change_pct"]
     if extra:
@@ -173,7 +187,7 @@ with tab2:
 
 with tab3:
     st.subheader("💰 资金流向")
-    st.caption("金额已统一为万元。主力 ≈ 超大单 + 大单；小单近似散户。源站限流或积分不足时会空表降级并标明原因。")
+    st.caption("金额已统一为万元。主力 ≈ 超大单 + 大单；小单近似散户。顶部「资金面倾向」是 1–5 日方向，不是涨跌预测。源站限流或积分不足时会空表降级并标明原因。")
 
     ctrl1, ctrl2, ctrl3 = st.columns(3)
     with ctrl1:
@@ -190,6 +204,7 @@ with tab3:
             enrich_sector_flow,
             extreme_rows,
             format_wan,
+            fund_flow_bias,
             main_vs_retail,
             northbound_regime,
             rank_inflow,
@@ -210,6 +225,14 @@ with tab3:
             boards = ak_data.get_industry_boards()
 
         sector = enrich_sector_flow(sector, boards)
+
+        market_bias = fund_flow_bias(
+            market_df=market_flow,
+            north_df=north,
+            sector_rank=sector,
+        )
+        _render_fund_bias_card(market_bias)
+        st.markdown("---")
 
         st.markdown("#### 市场资金")
         if market_flow is not None and not market_flow.empty and "main_net_inflow" in market_flow.columns:

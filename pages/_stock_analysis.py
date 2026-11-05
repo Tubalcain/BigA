@@ -187,7 +187,9 @@ if analyze_btn or 'show_analysis' in st.session_state:
             st.subheader("💰 资金流向")
             try:
                 from src.analysis.fund_flow import (
+                    bias_display,
                     format_wan,
+                    fund_flow_bias,
                     latest_stock_snapshot,
                     main_vs_retail,
                     price_flow_divergence,
@@ -200,6 +202,23 @@ if analyze_btn or 'show_analysis' in st.session_state:
                         start_date.strftime("%Y%m%d"),
                         end_date.strftime("%Y%m%d"),
                     )
+                    north = data_obj.get_northbound_flow()
+                stock_bias = fund_flow_bias(
+                    north_df=north,
+                    stock_flow=stock_flow,
+                    price_df=hist_data,
+                )
+                view = bias_display(stock_bias)
+                st.markdown(f"**{view['title']}**")
+                st.caption(view["disclaimer"])
+                b1, b2, b3 = st.columns(3)
+                b1.metric("倾向", view["bias"])
+                b2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
+                b3.metric("软评分", view["score_delta"])
+                for line in view["evidence"][:6]:
+                    st.caption("· " + line)
+                if view["reading"]:
+                    st.caption(view["reading"])
                 if stock_flow is not None and not stock_flow.empty:
                     snap = latest_stock_snapshot(stock_flow)
                     vs = main_vs_retail(stock_flow)

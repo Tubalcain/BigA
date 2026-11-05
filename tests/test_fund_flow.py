@@ -13,9 +13,13 @@ import pandas as pd
 from src.analysis.fund_flow import (
     actual_period_label,
     actual_sector_label,
+    apply_fund_flow_bias,
+    divergence_reading,
     enrich_sector_flow,
     extreme_rows,
+    flow_acceleration,
     format_wan,
+    fund_flow_bias,
     latest_stock_snapshot,
     main_vs_retail,
     northbound_regime,
@@ -23,6 +27,7 @@ from src.analysis.fund_flow import (
     rank_inflow,
     rank_outflow,
     scope_fallback_note,
+    sector_rotation_stats,
     stock_flow_notes,
     summarize_rank,
     unit_caption,
@@ -348,6 +353,120 @@ class FlowAnalysisTests(unittest.TestCase):
         text = unit_caption(df)
         self.assertIn("akshare", text)
         self.assertIn("万元", text)
+
+
+class FlowBiasTests(unittest.TestCase):
+    def _series(self, values, col="main_net_inflow"):
+        return pd.DataFrame(
+            {
+                "date": pd.date_range("2024-01-01", periods=len(values), freq="D"),
+                col: values,
+            }
+        )
+
+    def test_aligned_legs_are_bullish(self):
+        market = self._series([80, 90, 100, 110, 120, 130])
+        north = self._series([50, 60, 70, 80, 90, 100], col="net_inflow")
+        stock = self._series([20, 30, 40, 50, 60, 70])
+        industry = pd.DataFrame({"name": ["银行", "半导体", "煤炭"], "net_inflow": [800, 600, -50]})
+        industry.attrs["actual_sector"] = "行业资金流"
+        bias = fund_flow_bias(
+            market_df=market, north_df=north, sector_rank=industry, stock_flow=stock
+        )
+        self.assertEqual(bias["bias"], "偏多")
+        self.assertEqual(bias["horizon"], "1-5日")
+        self.assertGreater(bias["score_delta"], 0)
+        self.assertGreater(bias["confidence"], 0.5)
+        self.assertTrue(bias["quality_ok"])
+        self.assertEqual(bias["components"]["sector"]["sign"], 1)
+        self.assertTrue(bias["components"]["sector"]["usable_for_rotation"])
+
+    def test_conflict_is_split_with_zero_delta(self):
+        market = self._series([80, 90, 100, 110, 120, 130])
+        north = self._series([-50, -60, -70, -80, -90, -100], col="net_inflow")
+        bias = fund_flow_bias(market_df=market, north_df=north)
+        self.assertEqual(bias["bias"], "分化")
+        self.assertEqual(bias["score_delta"], 0)
+        self.assertLess(bias["confidence"], 0.5)
+        self.assertTrue(any("冲突" in line or "分化" in line for line in bias["evidence"]))
+
+    def test_overlapping_sector_is_not_market_total(self):
+        concept = pd.DataFrame(
+            {"name": ["人工智能", "ChatGPT", "算力"], "net_inflow": [9000, 8000, 7000]}
+        )
+        concept.attrs["actual_sector"] = "概念资金流"
+        rot = sector_rotation_stats(concept)
+        self.assertTrue(rot["overlapping"])
+        self.assertFalse(rot["usable_for_rotation"])
+        self.assertIsNone(rot["total_net_inflow"])
+        self.assertEqual(rot["sign"], 0)
+        bias = fund_flow_bias(sector_rank=concept)
+        self.assertEqual(bias["bias"], "中性")
+        self.assertEqual(bias["score_delta"], 0)
+        self.assertEqual(bias["components"]["sector"]["sign"], 0)
+        blob = " ".join(bias["evidence"])
+        self.assertIn("重叠", blob)
+        self.assertNotIn("派发", blob)
+        self.assertTrue(any("不计入市场合计" in line or "重叠" in line for line in bias["evidence"]))
+        self.assertFalse(any("全市场净流入" in line for line in bias["evidence"]))
+
+    def test_bad_quality_zeroes_score_delta(self):
+        market = self._series([80, 90, 100, 110, 120, 130])
+        stock = self._series([20, 30, 40, 50, 60, 70])
+        stock.attrs["ok"] = False
+        stock.attrs["issues"] = ["all-zero amounts"]
+        bias = fund_flow_bias(market_df=market, stock_flow=stock)
+        self.assertFalse(bias["quality_ok"])
+        self.assertEqual(bias["score_delta"], 0)
+        self.assertTrue(any("质量" in line for line in bias["evidence"]))
+
+    def test_missing_inputs_are_neutral(self):
+        bias = fund_flow_bias()
+        self.assertEqual(bias["bias"], "中性")
+        self.assertEqual(bias["score_delta"], 0)
+        self.assertEqual(bias["confidence"], 0)
+
+    def test_acceleration_and_divergence_reading(self):
+        accel_in = flow_acceleration(self._series([10, 10, 10, 10, 10, 80, 90, 100, 110, 120]), window=5)
+        self.assertEqual(accel_in["label"], "加速流入")
+        self.assertEqual(accel_in["sign"], 1)
+        accel_out = flow_acceleration(self._series([-10, -10, -10, -10, -10, -80, -90, -100, -110, -120]), window=5)
+        self.assertEqual(accel_out["label"], "加速流出")
+        reading = divergence_reading("价涨资出", streak=3)
+        self.assertIn("追高风险", reading)
+        self.assertIn("连续3日净流入", reading)
+        self.assertNotIn("派发", reading)
+        self.assertNotIn("吸筹", reading)
+        rebound = divergence_reading("价跌资进")
+        self.assertIn("关注反弹条件", rebound)
+        self.assertNotIn("吸筹", rebound)
+
+    def test_apply_fund_flow_bias_soft_score(self):
+        rec = {
+            "score": 4,
+            "recommendation": "持有",
+            "action": "HOLD",
+            "confidence": "中等",
+            "reason": "信号不明确",
+            "analysis_notes": ["技术面：持有"],
+        }
+        bull = fund_flow_bias(
+            market_df=self._series([80, 90, 100, 110, 120, 130]),
+            north_df=self._series([50, 60, 70, 80, 90, 100], col="net_inflow"),
+            stock_flow=self._series([20, 30, 40, 50, 60, 70]),
+        )
+        out = apply_fund_flow_bias(rec, bull, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5)
+        self.assertEqual(out["score_raw"], 4)
+        self.assertGreater(out["fund_score_delta"], 0)
+        self.assertEqual(out["score"], 4 + out["fund_score_delta"])
+        self.assertEqual(out["action"], "BUY")
+        self.assertTrue(any("资金面倾向" in n for n in out["analysis_notes"]))
+        bad = dict(bull)
+        bad["quality_ok"] = False
+        bad["score_delta"] = 2
+        zeroed = apply_fund_flow_bias(rec, bad)
+        self.assertEqual(zeroed["fund_score_delta"], 0)
+        self.assertEqual(zeroed["score"], 4)
 
 
 class FlowAdapterEmptyTests(unittest.TestCase):

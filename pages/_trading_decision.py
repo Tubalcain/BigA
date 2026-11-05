@@ -148,15 +148,42 @@ if analyze_btn or 'analyze' in st.session_state:
             
             # 选择分析引擎
             use_optimized = '优化版' in analysis_mode
+
+            from src.analysis.fund_flow import (
+                bias_display,
+                format_wan,
+                fund_flow_bias,
+                northbound_regime,
+                stock_flow_notes,
+            )
+            from src.data import describe_data_problems
+
+            end_key = end_date.strftime("%Y%m%d")
+            start_key = start_date.strftime("%Y%m%d")
+            flow_exc = None
+            try:
+                stock_flow = ak_data.get_stock_fund_flow(stock_code, start_key, end_key)
+                north = ak_data.get_northbound_flow()
+                market_flow = ak_data.get_market_fund_flow()
+            except Exception as exc:
+                flow_exc = exc
+                stock_flow, north, market_flow = None, None, None
+
+            flow_bias = fund_flow_bias(
+                market_df=market_flow,
+                north_df=north,
+                stock_flow=stock_flow,
+                price_df=hist_data,
+            )
             
             if use_optimized:
                 # 使用优化版分析引擎
                 signal_analyzer = OptimizedTradingSignalAnalyzer(hist_data)
-                recommendation = signal_analyzer.get_optimized_recommendation()
+                recommendation = signal_analyzer.get_optimized_recommendation(fund_flow_bias=flow_bias)
             else:
                 # 使用原版分析引擎
                 signal_analyzer = TradingSignalAnalyzer(hist_data)
-                recommendation = signal_analyzer.get_trading_recommendation()
+                recommendation = signal_analyzer.get_trading_recommendation(fund_flow_bias=flow_bias)
             
             # 高级分析
             advanced_analyzer = AdvancedTradingAnalyzer(hist_data, stock_code)
@@ -215,36 +242,38 @@ if analyze_btn or 'analyze' in st.session_state:
                 trend = trading_plan['trend']
                 st.metric("趋势状态", trend)
 
-            try:
-                from src.analysis.fund_flow import format_wan, northbound_regime, stock_flow_notes
-                from src.data import describe_data_problems
+            view = bias_display(flow_bias)
+            st.markdown(f"##### {view['title']}")
+            st.caption(view["disclaimer"])
+            bc1, bc2, bc3 = st.columns(3)
+            bc1.metric("倾向", view["bias"])
+            bc2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
+            bc3.metric("软评分", view["score_delta"])
+            for line in view["evidence"][:6]:
+                st.caption("· " + line)
 
-                end_key = end_date.strftime("%Y%m%d")
-                start_key = start_date.strftime("%Y%m%d")
-                stock_flow = ak_data.get_stock_fund_flow(stock_code, start_key, end_key)
-                north = ak_data.get_northbound_flow()
-                notes = stock_flow_notes(stock_flow, north)
-                st.markdown("##### 资金面")
-                if stock_flow is not None and not stock_flow.empty and "main_net_inflow" in stock_flow.columns:
-                    latest_main = stock_flow["main_net_inflow"].iloc[-1]
-                    sum_5 = pd.to_numeric(stock_flow["main_net_inflow"].tail(5), errors="coerce").sum()
-                    fc1, fc2, fc3 = st.columns(3)
-                    fc1.metric("主力净流入", format_wan(latest_main))
-                    fc2.metric("近5日主力", format_wan(sum_5))
-                    regime = northbound_regime(north) if north is not None else {}
-                    fc3.metric("北向5日", format_wan(regime.get("window_sum")))
-                    if notes:
-                        st.caption("；".join(notes))
-                else:
-                    st.info("个股资金序列暂不可用。")
-                    reason = describe_data_problems(stock_flow)
-                    if reason:
-                        st.caption(reason)
-                    if north is not None and not north.empty:
-                        regime = northbound_regime(north)
-                        st.caption(regime.get("note") or "")
-            except Exception as flow_exc:
+            notes = stock_flow_notes(stock_flow, north)
+            st.markdown("##### 资金面")
+            if flow_exc is not None:
                 st.caption(f"资金面暂不可用: {flow_exc}")
+            elif stock_flow is not None and not stock_flow.empty and "main_net_inflow" in stock_flow.columns:
+                latest_main = stock_flow["main_net_inflow"].iloc[-1]
+                sum_5 = pd.to_numeric(stock_flow["main_net_inflow"].tail(5), errors="coerce").sum()
+                fc1, fc2, fc3 = st.columns(3)
+                fc1.metric("主力净流入", format_wan(latest_main))
+                fc2.metric("近5日主力", format_wan(sum_5))
+                regime = northbound_regime(north) if north is not None else {}
+                fc3.metric("北向5日", format_wan(regime.get("window_sum")))
+                if notes:
+                    st.caption("；".join(notes))
+            else:
+                st.info("个股资金序列暂不可用。")
+                reason = describe_data_problems(stock_flow)
+                if reason:
+                    st.caption(reason)
+                if north is not None and not north.empty:
+                    regime = northbound_regime(north)
+                    st.caption(regime.get("note") or "")
             
             # 2. 止损止盈建议
             if show_stop_loss:

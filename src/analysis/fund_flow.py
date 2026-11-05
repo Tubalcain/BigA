@@ -1,8 +1,9 @@
 """
-资金流向分析：排名、主力/散户、趋势、北向状态、价资背离。
+资金流向分析：排名、主力/散户、趋势、北向状态、价资背离、短周期倾向。
 
 输入是 quality.prepare_* 之后的标准表（金额单位：万元）。
 页面只做展示，计算放在这里。
+资金面倾向是 1–5 日方向，不是涨跌预测。
 """
 
 from __future__ import annotations
@@ -408,7 +409,7 @@ def latest_stock_snapshot(df):
 
 
 def stock_flow_notes(df, north_df=None):
-    """给交易页的短备注，不改评分模型。"""
+    """给交易页的短备注。评分改动走 fund_flow_bias.score_delta，不在这里改。"""
     notes = []
     if df is not None and not df.empty:
         snap = latest_stock_snapshot(df)
@@ -454,14 +455,512 @@ def enrich_sector_flow(flow, boards):
     return merged
 
 
+_SERIOUS_QUALITY_MARKERS = (
+    "empty frame",
+    "all-zero amounts",
+    "all null",
+    "missing column",
+    "missing inflow",
+    "unavailable",
+)
+
+BIAS_BULL = "偏多"
+BIAS_BEAR = "偏空"
+BIAS_NEUTRAL = "中性"
+BIAS_SPLIT = "分化"
+BIAS_HORIZON = "1-5日"
+_LEG_CN = {
+    "market": "市场主力",
+    "north": "北向",
+    "sector": "板块",
+    "stock": "个股",
+}
+
+
+def _numeric_sign(value, eps=0.0):
+    if value is None:
+        return 0
+    try:
+        if pd.isna(value):
+            return 0
+    except (TypeError, ValueError):
+        return 0
+    number = float(value)
+    if math.isnan(number) or math.isinf(number) or abs(number) <= float(eps):
+        return 0
+    return 1 if number > 0 else -1
+
+
+def _flow_value_col(df, preferred=("main_net_inflow", "net_inflow")):
+    if df is None:
+        return None
+    for col in preferred:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _frame_has_rows(df):
+    return df is not None and not getattr(df, "empty", True)
+
+
+def _frame_quality_ok(df):
+    """缺数据不算质量差；attrs.ok=False 或严重 issues 才判不合格。"""
+    if not _frame_has_rows(df):
+        return True
+    if df.attrs.get("ok") is False:
+        return False
+    for item in df.attrs.get("issues") or []:
+        text = str(item)
+        if any(marker in text for marker in _SERIOUS_QUALITY_MARKERS):
+            return False
+    return True
+
+
+def empty_fund_bias(reason="资金数据不足，不下倾向"):
+    return {
+        "bias": BIAS_NEUTRAL,
+        "horizon": BIAS_HORIZON,
+        "confidence": 0.0,
+        "confidence_label": "低",
+        "evidence": [reason] if reason else [],
+        "score_delta": 0.0,
+        "components": {},
+        "quality_ok": True,
+        "label": "资金面倾向（1–5日）",
+        "disclaimer": "资金面倾向，不是涨跌预测",
+    }
+
+
+def flow_acceleration(df, col=None, window=5):
+    """Δ(近 window 日合计 − 前 window 日合计)。序列不够长则不下结论。"""
+    result = {
+        "delta": None,
+        "recent": None,
+        "previous": None,
+        "label": "",
+        "sign": 0,
+        "window": int(window),
+    }
+    col = col or _flow_value_col(df)
+    need = int(window) * 2
+    if not col or not _ready(df, [col]) or len(df) < need:
+        return result
+    work = df.sort_values("date") if "date" in df.columns else df
+    series = pd.to_numeric(work[col], errors="coerce")
+    recent = series.tail(int(window))
+    previous = series.iloc[-need : -int(window)]
+    if not recent.notna().any() or not previous.notna().any():
+        return result
+    recent_sum = float(recent.sum())
+    previous_sum = float(previous.sum())
+    delta = recent_sum - previous_sum
+    result["recent"] = recent_sum
+    result["previous"] = previous_sum
+    result["delta"] = delta
+    if abs(delta) < 1.0:
+        result["label"] = "近段流速变化很小"
+        return result
+    prev_sign = _numeric_sign(previous_sum)
+    rec_sign = _numeric_sign(recent_sum)
+    if rec_sign > 0 and delta > 0:
+        result["label"] = "加速流入"
+        result["sign"] = 1
+    elif rec_sign > 0 and delta < 0:
+        result["label"] = "流入减速"
+        result["sign"] = 0
+    elif rec_sign < 0 and delta < 0:
+        result["label"] = "加速流出"
+        result["sign"] = -1
+    elif rec_sign < 0 and delta > 0:
+        result["label"] = "流出放缓"
+        result["sign"] = 0
+    elif prev_sign < 0 and rec_sign > 0:
+        result["label"] = "由出转进"
+        result["sign"] = 1
+    elif prev_sign > 0 and rec_sign < 0:
+        result["label"] = "由进转出"
+        result["sign"] = -1
+    else:
+        result["label"] = "流速变化中性"
+    return result
+
+
+def divergence_reading(note, streak=None):
+    """价资背离的短读法：只描述短周期含义，不下派发/吸筹结论。"""
+    if not note:
+        return ""
+    extra = ""
+    if streak:
+        direction = "流入" if streak > 0 else "流出"
+        extra = f"（主力连续{abs(int(streak))}日净{direction}）"
+    mapping = {
+        "价涨资出": f"价涨资出{extra}：短周期追高风险，价格上涨但资金未同步",
+        "价跌资进": f"价跌资进{extra}：关注反弹条件，资金先行、价格尚未确认",
+        "价资同向（上涨）": f"价资同向（上涨）{extra}：短周期资金与价格同向",
+        "价资同向（下跌）": f"价资同向（下跌）{extra}：短周期资金与价格同向走弱",
+    }
+    return mapping.get(str(note), str(note))
+
+
+def latest_divergence_note(price_df, flow_df):
+    table = price_flow_divergence(price_df, flow_df)
+    if table is None or table.empty or "note" not in table.columns:
+        return ""
+    notes = table["note"].astype(str)
+    nonempty = notes[notes.str.len() > 0]
+    if nonempty.empty:
+        return ""
+    return str(nonempty.iloc[-1])
+
+
+def sector_rotation_stats(rank_df, column="net_inflow", top_n=5):
+    """
+    行业榜的广度 / 头部集中度，供轮动观察。
+    概念/地域重叠时 usable_for_rotation=False，合计不当作全市场。
+    """
+    overlapping = _is_overlapping_rank(rank_df)
+    empty = {
+        "overlapping": overlapping,
+        "usable_for_rotation": False,
+        "inflow_count": 0,
+        "outflow_count": 0,
+        "breadth": None,
+        "top_concentration": None,
+        "top_names": [],
+        "total_net_inflow": None,
+        "sign": 0,
+        "note": "板块排名不可用",
+    }
+    if not _ready(rank_df, [column]):
+        return empty
+    values = pd.to_numeric(rank_df[column], errors="coerce")
+    inflow_count = int((values > 0).sum())
+    outflow_count = int((values < 0).sum())
+    counted = inflow_count + outflow_count
+    breadth = (inflow_count / counted) if counted else None
+    names = rank_df["name"] if "name" in rank_df.columns else rank_df.get("code", pd.Series([""] * len(rank_df)))
+    ranked = rank_df.assign(_flow=values, _label=names.astype(str)).dropna(subset=["_flow"])
+    top = ranked.nlargest(int(top_n), "_flow")
+    positive = values[values > 0]
+    top_concentration = None
+    if not positive.empty and float(positive.sum()) != 0:
+        top_sum = float(pd.to_numeric(top["_flow"], errors="coerce").clip(lower=0).sum())
+        top_concentration = top_sum / float(positive.sum())
+    total = None if overlapping else float(values.fillna(0).sum())
+    if overlapping:
+        note = "概念/地域互相重叠，仅行业榜可用于轮动合计；此处只作榜内广度"
+        sign = 0
+        usable = False
+    else:
+        usable = True
+        if inflow_count > outflow_count or (total is not None and total > 0):
+            sign = 1
+        elif outflow_count > inflow_count or (total is not None and total < 0):
+            sign = -1
+        else:
+            sign = 0
+        note = f"行业流入{inflow_count} / 流出{outflow_count}，可用于轮动观察"
+        if top_concentration is not None:
+            note += f"；前{int(top_n)}占流入约{top_concentration:.0%}"
+    return {
+        "overlapping": overlapping,
+        "usable_for_rotation": usable,
+        "inflow_count": inflow_count,
+        "outflow_count": outflow_count,
+        "breadth": breadth,
+        "top_concentration": top_concentration,
+        "top_names": [str(row["_label"]) for _, row in top.iterrows()],
+        "total_net_inflow": total,
+        "sign": sign,
+        "note": note,
+    }
+
+
+def _confidence_label(value):
+    if value >= 0.67:
+        return "高"
+    if value >= 0.34:
+        return "中"
+    return "低"
+
+
+def _leg_component(sign=0, available=False, quality_ok=True, **extra):
+    payload = {
+        "sign": int(sign),
+        "available": bool(available),
+        "quality_ok": bool(quality_ok),
+    }
+    payload.update(extra)
+    return payload
+
+
+def fund_flow_bias(
+    market_df=None,
+    north_df=None,
+    sector_rank=None,
+    stock_flow=None,
+    price_df=None,
+):
+    """
+    合成短周期资金面倾向。返回偏多/偏空/中性/分化，不是涨跌预测。
+    质量不合格的腿权重为 0；若有不合格输入，score_delta 为 0。
+    """
+    result = empty_fund_bias()
+    evidence = []
+    votes = []
+    components = {}
+    quality_ok = True
+    caution = False
+
+    def _take(name, df):
+        nonlocal quality_ok
+        if not _frame_has_rows(df):
+            components[name] = _leg_component(available=False)
+            return False
+        if not _frame_quality_ok(df):
+            quality_ok = False
+            components[name] = _leg_component(available=True, quality_ok=False)
+            evidence.append(f"{_LEG_CN.get(name, name)}数据质量不足，该腿不计入")
+            return False
+        return True
+
+    if _take("market", market_df):
+        col = _flow_value_col(market_df)
+        stats = flow_trend_stats(market_df, value_col=col or "main_net_inflow")
+        accel = flow_acceleration(market_df, col=col)
+        window5 = (stats.get("windows") or {}).get(5)
+        sign = _numeric_sign(window5 if window5 is not None else stats.get("latest"))
+        streak = int(stats.get("streak") or 0)
+        if stats.get("latest") is not None:
+            evidence.append(
+                f"市场主力最新 {format_wan(stats['latest'])}，近5日 {format_wan(window5)}"
+            )
+        if streak:
+            evidence.append(f"市场主力连续{abs(streak)}日净{'流入' if streak > 0 else '流出'}")
+        if accel.get("label"):
+            evidence.append(f"市场{accel['label']}")
+            if accel.get("sign") and sign == 0:
+                sign = int(accel["sign"])
+        components["market"] = _leg_component(
+            sign=sign, available=True, streak=streak, accel=accel.get("label") or ""
+        )
+        if sign:
+            votes.append(("market", sign, 1.5))
+
+    if _take("north", north_df):
+        regime = northbound_regime(north_df)
+        sign = {"inflow": 1, "outflow": -1}.get(regime.get("regime"), 0)
+        if regime.get("note") and regime.get("regime") != "unknown":
+            evidence.append(regime["note"])
+        components["north"] = _leg_component(
+            sign=sign, available=True, regime=regime.get("regime")
+        )
+        if sign:
+            votes.append(("north", sign, 1.0))
+
+    if _take("sector", sector_rank):
+        rot = sector_rotation_stats(sector_rank)
+        if rot.get("overlapping"):
+            evidence.append(rot.get("note") or "概念/地域重叠，合计不能当作全市场")
+            evidence.append(
+                f"榜内流入{rot.get('inflow_count', 0)} / 流出{rot.get('outflow_count', 0)}（不计入市场合计）"
+            )
+            components["sector"] = _leg_component(
+                sign=0,
+                available=True,
+                overlapping=True,
+                usable_for_rotation=False,
+                inflow_count=rot.get("inflow_count"),
+                outflow_count=rot.get("outflow_count"),
+            )
+        else:
+            sign = int(rot.get("sign") or 0)
+            if rot.get("note"):
+                evidence.append(rot["note"])
+            components["sector"] = _leg_component(
+                sign=sign,
+                available=True,
+                overlapping=False,
+                usable_for_rotation=True,
+                inflow_count=rot.get("inflow_count"),
+                outflow_count=rot.get("outflow_count"),
+                top_concentration=rot.get("top_concentration"),
+            )
+            if sign:
+                votes.append(("sector", sign, 1.0))
+
+    stock_streak = 0
+    if _take("stock", stock_flow):
+        snap = latest_stock_snapshot(stock_flow)
+        col = _flow_value_col(stock_flow)
+        accel = flow_acceleration(stock_flow, col=col)
+        sign = _numeric_sign(snap.get("sum_5d") if snap.get("sum_5d") is not None else snap.get("latest_main"))
+        stock_streak = int(snap.get("streak") or 0)
+        if snap.get("latest_main") is not None:
+            evidence.append(f"个股主力最新 {format_wan(snap['latest_main'])}，近5日 {format_wan(snap.get('sum_5d'))}")
+        if stock_streak:
+            evidence.append(
+                f"个股主力连续{abs(stock_streak)}日净{'流入' if stock_streak > 0 else '流出'}"
+            )
+        if snap.get("note"):
+            evidence.append(snap["note"])
+        if accel.get("label"):
+            evidence.append(f"个股{accel['label']}")
+            if accel.get("sign") and sign == 0:
+                sign = int(accel["sign"])
+        components["stock"] = _leg_component(
+            sign=sign, available=True, streak=stock_streak, accel=accel.get("label") or ""
+        )
+        if sign:
+            votes.append(("stock", sign, 1.2))
+
+    div_note = latest_divergence_note(price_df, stock_flow) if price_df is not None else ""
+    reading = divergence_reading(div_note, streak=stock_streak or None)
+    div_sign = 0
+    if div_note in ("价资同向（上涨）",):
+        div_sign = 1
+    elif div_note in ("价资同向（下跌）",):
+        div_sign = -1
+    elif div_note in ("价涨资出", "价跌资进"):
+        caution = True
+    if reading:
+        evidence.append(reading)
+    if price_df is not None or div_note:
+        components["divergence"] = _leg_component(
+            sign=div_sign, available=bool(div_note), note=div_note, reading=reading
+        )
+        if div_sign:
+            votes.append(("divergence", div_sign, 0.8))
+
+    if not evidence:
+        return result
+
+    bull = sum(1 for _, sign, _ in votes if sign > 0)
+    bear = sum(1 for _, sign, _ in votes if sign < 0)
+    n_avail = sum(1 for item in components.values() if item.get("available") and item.get("quality_ok"))
+    weighted = sum(sign * weight for _, sign, weight in votes)
+
+    if bull and bear:
+        bias = BIAS_SPLIT
+        evidence.append("资金腿方向冲突，倾向记为分化")
+        confidence = min(0.45, 0.18 + 0.06 * n_avail)
+    elif bull and not bear:
+        bias = BIAS_BULL
+        confidence = 0.35 + 0.15 * bull + 0.05 * n_avail
+    elif bear and not bull:
+        bias = BIAS_BEAR
+        confidence = 0.35 + 0.15 * bear + 0.05 * n_avail
+    else:
+        bias = BIAS_NEUTRAL
+        confidence = 0.2 if n_avail else 0.0
+
+    if caution:
+        confidence *= 0.85
+    if not quality_ok:
+        confidence *= 0.4
+    confidence = max(0.0, min(1.0, float(confidence)))
+
+    if (not quality_ok) or bias in (BIAS_NEUTRAL, BIAS_SPLIT) or confidence < 0.25:
+        score_delta = 0.0
+    else:
+        magnitude = 2.0 if confidence >= 0.6 else 1.0
+        score_delta = magnitude if bias == BIAS_BULL else -magnitude
+
+    if not quality_ok:
+        evidence.append("存在质量不合格数据，交易软评分为 0")
+
+    result.update(
+        {
+            "bias": bias,
+            "horizon": BIAS_HORIZON,
+            "confidence": round(confidence, 3),
+            "confidence_label": _confidence_label(confidence),
+            "evidence": evidence,
+            "score_delta": float(score_delta),
+            "components": components,
+            "quality_ok": quality_ok,
+            "net_vote": float(weighted),
+        }
+    )
+    return result
+
+
+def bias_display(bias):
+    """页面卡片用的展示字段。"""
+    payload = bias or empty_fund_bias()
+    conf = float(payload.get("confidence") or 0)
+    return {
+        "title": payload.get("label") or "资金面倾向（1–5日）",
+        "disclaimer": payload.get("disclaimer") or "资金面倾向，不是涨跌预测",
+        "bias": payload.get("bias") or BIAS_NEUTRAL,
+        "confidence_label": payload.get("confidence_label") or "低",
+        "confidence_pct": f"{conf:.0%}",
+        "score_delta": f"{float(payload.get('score_delta') or 0):+.1f}",
+        "evidence": list(payload.get("evidence") or []),
+        "reading": ((payload.get("components") or {}).get("divergence") or {}).get("reading") or "",
+        "horizon": payload.get("horizon") or BIAS_HORIZON,
+    }
+
+
+def _action_from_score(score, strong_buy, buy, hold_floor, sell_floor):
+    if score >= strong_buy:
+        return "强烈买入", "BUY", "高"
+    if score >= buy:
+        return "买入", "BUY", "中等"
+    if score >= hold_floor:
+        return "持有", "HOLD", "中等"
+    if score >= sell_floor:
+        return "减仓", "SELL", "中等"
+    return "卖出", "SELL", "高"
+
+
+def apply_fund_flow_bias(recommendation, bias=None, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5):
+    """
+    把资金面 score_delta 软加到交易评分。质量不合格或缺失时加 0。
+    不改止损；若评分跨过阈值则同步更新 action。
+    """
+    rec = dict(recommendation or {})
+    payload = bias or empty_fund_bias()
+    raw = float(rec.get("score") or 0)
+    delta = float(payload.get("score_delta") or 0)
+    if payload.get("quality_ok") is False:
+        delta = 0.0
+    rec["score_raw"] = raw
+    rec["fund_score_delta"] = delta
+    rec["fund_flow_bias"] = payload
+    rec["score"] = raw + delta
+    notes = list(rec.get("analysis_notes") or [])
+    notes.append(
+        f"资金面倾向（{payload.get('horizon') or BIAS_HORIZON}）："
+        f"{payload.get('bias') or BIAS_NEUTRAL}，"
+        f"信心{payload.get('confidence_label') or '低'}，软评分 {delta:+.1f}"
+    )
+    for line in payload.get("evidence") or []:
+        notes.append(f"资金面：{line}")
+    rec["analysis_notes"] = notes
+    action, action_code, confidence = _action_from_score(
+        rec["score"], strong_buy, buy, hold_floor, sell_floor
+    )
+    rec["recommendation"] = action
+    rec["action"] = action_code
+    rec["confidence"] = confidence
+    if delta:
+        reason = rec.get("reason") or ""
+        suffix = f"资金面软评分 {delta:+.1f}（倾向，非预测）"
+        rec["reason"] = f"{reason}；{suffix}" if reason else suffix
+    return rec
+
+
 class FundFlowAnalyzer:
     """可选的薄封装，方便页面一次传入多张表。"""
 
-    def __init__(self, rank_df=None, stock_df=None, north_df=None, market_df=None):
+    def __init__(self, rank_df=None, stock_df=None, north_df=None, market_df=None, price_df=None):
         self.rank_df = rank_df
         self.stock_df = stock_df
         self.north_df = north_df
         self.market_df = market_df
+        self.price_df = price_df
 
     def rank_summary(self, n=8):
         return summarize_rank(self.rank_df, n=n)
@@ -474,3 +973,12 @@ class FundFlowAnalyzer:
 
     def notes(self):
         return stock_flow_notes(self.stock_df, self.north_df)
+
+    def bias(self, price_df=None):
+        return fund_flow_bias(
+            market_df=self.market_df,
+            north_df=self.north_df,
+            sector_rank=self.rank_df,
+            stock_flow=self.stock_df,
+            price_df=price_df if price_df is not None else self.price_df,
+        )

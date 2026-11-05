@@ -39,7 +39,22 @@ with st.sidebar:
 
     st.subheader("💰 资金流向")
     use_fund_flow = st.checkbox("叠加主力资金排名", value=False, help="多一次排名接口；限流时会跳过并提示。")
+    flow_period = st.selectbox(
+        "资金排名周期",
+        ["今日", "3日", "5日"],
+        index=0,
+        help="用排名接口的周期合计，不逐股拉历史。",
+    )
     min_net_inflow = st.number_input("最小主力净流入（万元）", value=0.0, step=1000.0)
+    require_period_inflow = st.checkbox(
+        "仅保留该周期净流入>0",
+        value=False,
+        help="近似「连续流入」：用 3日/5日排名净额，不是逐日 streak。",
+    )
+    st.caption(
+        "「连续流入」依赖排名接口的多日净额，不逐股请求历史。"
+        "价资同向需要个股 K 线 + 资金序列，筛选器不逐股打接口，故未提供该开关。"
+    )
 
     # 筛选按钮
     screen_btn = st.button("🚀 开始筛选", type="primary", use_container_width=True)
@@ -81,14 +96,18 @@ if screen_btn:
                 filtered = filtered[filtered["status"] != "halted"]
                 applied.append("非停牌")
             if use_fund_flow:
-                rank = ak_data.get_stock_fund_flow_rank()
+                rank = ak_data.get_stock_fund_flow_rank(indicator=flow_period)
                 if rank is not None and not rank.empty and "code" in rank.columns:
-                    keep = [c for c in ["code", "net_inflow", "main_net_inflow"] if c in rank.columns]
+                    keep = [c for c in ["code", "net_inflow", "main_net_inflow", "period"] if c in rank.columns]
                     extra = rank[keep].drop_duplicates("code")
                     filtered = filtered.merge(extra, on="code", how="left")
                     if min_net_inflow and "net_inflow" in filtered.columns:
                         filtered = filtered[filtered["net_inflow"].fillna(0) >= min_net_inflow]
-                    applied.append("主力资金")
+                    if require_period_inflow and "net_inflow" in filtered.columns:
+                        filtered = filtered[filtered["net_inflow"].fillna(0) > 0]
+                    applied.append(f"主力资金({flow_period})")
+                    if require_period_inflow:
+                        applied.append(f"{flow_period}净流入>0")
                 else:
                     st.caption("主力资金排名暂不可用，已跳过该条件。")
                     reason = describe_data_problems(rank)
@@ -167,7 +186,7 @@ else:
         - **市值**: 按总市值（万元）筛选
         - **涨跌幅**: 按当日涨幅筛选
         - **成交量**: 按成交量（手）筛选
-        - **主力资金**: 可选叠加个股净流入排名（万元）
+        - **主力资金**: 可选叠加个股净流入排名（万元）；「该周期净流入>0」用排名接口，不逐股拉历史。价资同向未提供。
         """)
 
     with col2:
