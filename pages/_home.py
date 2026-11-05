@@ -50,11 +50,9 @@ st.markdown("---")
 st.subheader("📊 市场概况")
 
 try:
-    from src.data import get_data_source
+    from src.data import describe_data_problems, get_active_client
 
-    ak_data = get_data_source(st.session_state.get("data_source", "akshare"))
-    if not ak_data.is_available():
-        ak_data = get_data_source("akshare")
+    ak_data = get_active_client(st.session_state.get("data_source", "akshare"))
     # 首页只拉指数，避免每次打开都打全市场快照（易限流、很慢）
     indices = ak_data.get_index_quotes()
     overview = ak_data.get_market_overview(light=True)
@@ -88,6 +86,11 @@ try:
         st.caption(f"数据来源: {source}")
     if not shown:
         st.info("市场快照暂不可用，请检查网络后刷新。")
+        for frame in (indices, overview):
+            msg = describe_data_problems(frame)
+            if msg and msg != "empty frame":
+                st.caption(msg)
+                break
 except Exception as exc:
     st.info("正在加载市场数据...")
     st.caption(str(exc))

@@ -20,8 +20,8 @@ with st.sidebar:
     stock_code = st.text_input(
         "股票代码",
         value="000001",
-        help="输入6位股票代码，如：000001（平安银行）"
-    )
+        help="6 位代码，如 000001；也可写 000001.SZ"
+    ).strip()
     
     # 数据源选择
     data_source = st.radio(
@@ -68,16 +68,19 @@ if analyze_btn or 'show_analysis' in st.session_state:
     
     # 获取股票基本信息
     try:
-        from src.data import get_data_source
+        from src.data import describe_data_problems, get_active_client, outlier_count
         from src.analysis.technical import TechnicalAnalyzer
         from src.visualization.charts import PlotlyChartGenerator
         
         preferred = "akshare" if data_source == "AKShare" else "tushare"
-        data_obj = get_data_source(preferred)
-        if preferred == "tushare" and not data_obj.is_available():
-            st.warning("TuShare未配置，切换为AKShare")
-            data_obj = get_data_source("akshare")
+        data_obj = get_active_client(preferred)
+        if preferred == "tushare" and getattr(data_obj, "name", "") != "tushare":
+            st.warning("TuShare 未配置或不可用，已切换为 AKShare")
             data_source = "AKShare"
+
+        if start_date > end_date:
+            st.warning("开始日期晚于结束日期，已按时间顺序交换。")
+            start_date, end_date = end_date, start_date
         
         with st.spinner("正在获取数据..."):
             hist_data = data_obj.get_history_data(
@@ -90,6 +93,11 @@ if analyze_btn or 'show_analysis' in st.session_state:
         if not hist_data.empty:
             used_source = hist_data.attrs.get("source") or data_source
             st.success(f"✓ 成功获取 {len(hist_data)} 条数据（来源: {used_source}）")
+            if hist_data.attrs.get("date_range_swapped"):
+                st.caption("开始/结束日期已按时间顺序交换。")
+            n_out = outlier_count(hist_data)
+            if n_out:
+                st.caption(f"有 {n_out} 根 K 线涨跌幅异常（is_outlier），已保留。")
             with st.expander("🔍 调试信息（点击查看数据列名）"):
                 st.write("数据列名:", list(hist_data.columns))
                 st.write("attrs:", {k: hist_data.attrs.get(k) for k in ("source", "timezone", "issues", "ok")})
@@ -177,13 +185,9 @@ if analyze_btn or 'show_analysis' in st.session_state:
             
         else:
             st.error(f"❌ 未能获取股票 {stock_code} 的数据")
-            if hist_data is not None:
-                err = hist_data.attrs.get("error")
-                issues = hist_data.attrs.get("issues")
-                if err:
-                    st.caption(f"原因: {err}")
-                if issues:
-                    st.caption("校验: " + ", ".join(issues))
+            msg = describe_data_problems(hist_data)
+            if msg:
+                st.caption(msg)
             
             with st.expander("🆘 可能的原因和解决方案"):
                 st.markdown("""

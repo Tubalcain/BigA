@@ -17,6 +17,8 @@ from src.data.config import get_data_config, load_app_config
 from src.data.quality import (
     clean_ohlcv,
     compact_date,
+    describe_data_problems,
+    empty_ohlcv,
     infer_board,
     infer_exchange,
     match_exchange,
@@ -25,6 +27,7 @@ from src.data.quality import (
     normalize_period,
     normalize_quotes,
     normalize_stock_code,
+    outlier_count,
     prepare_ohlcv,
     to_ts_code,
     validate_ohlcv,
@@ -107,6 +110,23 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(quotes.iloc[0]["exchange"], "深圳交易所")
         self.assertNotIn("买入", quotes.columns)
 
+    def test_quotes_drop_empty_and_short_codes(self):
+        raw = pd.DataFrame(
+            {
+                "code": ["1", "", "000001", "000002.SZ"],
+                "name": ["x", "y", "平安银行", "万科A"],
+                "price": [1.0, 2.0, 10.0, 11.0],
+            }
+        )
+        quotes = normalize_quotes(raw, source="test")
+        self.assertEqual(list(quotes["code"]), ["000001", "000002"])
+        empty = normalize_quotes(
+            pd.DataFrame({"code": ["1", ""], "price": [1.0, 2.0]}),
+            source="test",
+        )
+        self.assertTrue(empty.empty)
+        self.assertIn("no valid stock codes", empty.attrs.get("issues", []))
+
     def test_short_code_does_not_pad_to_pingan(self):
         df = prepare_ohlcv(pd.DataFrame(), source="test", code="1")
         self.assertTrue(df.empty)
@@ -130,6 +150,42 @@ class QualityTests(unittest.TestCase):
         self.assertNotIn("junk", df.columns)
         self.assertEqual(df["date"].min(), pd.Timestamp("2024-01-02"))
         self.assertEqual(df["date"].max(), pd.Timestamp("2024-01-03"))
+
+    def test_prepare_ohlcv_swaps_inverted_dates(self):
+        raw = pd.DataFrame(
+            {
+                "date": ["20240101", "20240102", "20240103"],
+                "open": [10, 10, 10],
+                "high": [11, 11, 11],
+                "low": [9, 9, 9],
+                "close": [10, 10.2, 10.1],
+                "volume": [1, 1, 1],
+            }
+        )
+        df = prepare_ohlcv(raw, source="test", start="20240103", end="20240101")
+        self.assertFalse(df.empty)
+        self.assertEqual(len(df), 3)
+        self.assertTrue(df.attrs.get("date_range_swapped"))
+        self.assertIn("start/end dates swapped", df.attrs.get("issues", []))
+        self.assertTrue(df.attrs.get("ok"))
+
+    def test_describe_data_problems_and_outliers(self):
+        empty = empty_ohlcv("akshare", error="akshare unavailable", issues=["akshare unavailable"])
+        text = describe_data_problems(empty)
+        self.assertIn("akshare unavailable", text)
+        self.assertEqual(describe_data_problems(None), "无数据")
+        raw = pd.DataFrame(
+            {
+                "date": ["20240101", "20240102"],
+                "open": [10, 10],
+                "high": [11, 30],
+                "low": [9, 9],
+                "close": [10, 25],
+                "volume": [1, 1],
+            }
+        )
+        df = prepare_ohlcv(raw, source="test")
+        self.assertGreaterEqual(outlier_count(df), 1)
 
     def test_validate_detects_dirty_bars(self):
         dirty = pd.DataFrame(
@@ -220,6 +276,20 @@ class CacheConfigTests(unittest.TestCase):
         self.assertEqual(ts.name, "tushare")
         self.assertFalse(ts.is_available())
 
+    def test_get_active_client_falls_back_when_tushare_unavailable(self):
+        from src.data import get_active_client, get_data_source
+        from src.data.akshare_data import AKShareData
+
+        os.environ.pop("TUSHARE_TOKEN", None)
+        load_app_config.cache_clear()
+        get_data_config(reload=True)
+        client = get_active_client("tushare")
+        ak = get_data_source("akshare")
+        if ak.is_available():
+            self.assertIsInstance(client, AKShareData)
+        else:
+            self.assertEqual(client.name, "tushare")
+
     def test_tushare_unavailable_without_token(self):
         from src.data.tushare_data import TuShareData
 
@@ -231,7 +301,34 @@ class CacheConfigTests(unittest.TestCase):
         self.assertFalse(client.is_available())
         hist = client.get_history_data("000001", "20240101", "20240110", allow_fallback=False)
         self.assertTrue(hist.empty)
+        self.assertIn("tushare unavailable", hist.attrs.get("issues", []))
         self.assertListEqual(list(hist.columns)[:6], ["date", "open", "high", "low", "close", "volume"])
+        quote = client.get_realtime_quote("1")
+        self.assertTrue(quote.empty)
+        self.assertIn("invalid stock code", quote.attrs.get("issues", []))
+
+    def test_disabled_akshare_returns_empty_not_raise(self):
+        from src.data.akshare_data import AKShareData
+
+        cfg = get_data_config(reload=True)
+        previous = cfg.akshare.enabled
+        try:
+            cfg.akshare.enabled = False
+            client = AKShareData(cfg)
+            self.assertFalse(client.is_available())
+            hist = client.get_history_data("000001", "20240101", "20240110", allow_fallback=False)
+            self.assertTrue(hist.empty)
+            self.assertIn("akshare unavailable", hist.attrs.get("issues", []))
+            quote = client.get_realtime_quote("1")
+            self.assertTrue(quote.empty)
+            self.assertIn("invalid stock code", quote.attrs.get("issues", []))
+            quote2 = client.get_realtime_quote("000001")
+            self.assertIsNotNone(quote2)
+            overview = client.get_market_overview(light=True)
+            self.assertTrue(overview.empty)
+            self.assertIn("akshare unavailable", overview.attrs.get("issues", []))
+        finally:
+            cfg.akshare.enabled = previous
 
 
 if __name__ == "__main__":

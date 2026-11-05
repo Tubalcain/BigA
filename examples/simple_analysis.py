@@ -31,7 +31,10 @@ def simple_stock_analysis(stock_code="000001"):
     hist = ak_data.get_history_data(stock_code, "20240101", "20241201")
     
     if hist.empty:
+        from src.data import describe_data_problems
+
         print("✗ 未能获取数据")
+        print("  ", describe_data_problems(hist))
         return
     
     print(f"✓ 获取到 {len(hist)} 条历史数据")

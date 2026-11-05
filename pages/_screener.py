@@ -43,11 +43,9 @@ with st.sidebar:
 # 主内容区域
 if screen_btn:
     try:
-        from src.data import get_data_source
+        from src.data import describe_data_problems, get_active_client
 
-        ak_data = get_data_source(st.session_state.get("data_source", "akshare"))
-        if not ak_data.is_available():
-            ak_data = get_data_source("akshare")
+        ak_data = get_active_client(st.session_state.get("data_source", "akshare"))
 
         with st.spinner("正在获取股票列表..."):
             df = ak_data.get_stock_list(exchange)
@@ -117,6 +115,9 @@ if screen_btn:
                 )
         else:
             st.warning("未能获取股票列表")
+            msg = describe_data_problems(df)
+            if msg:
+                st.caption(msg)
 
     except Exception as e:
         st.error(f"筛选过程中发生错误: {str(e)}")

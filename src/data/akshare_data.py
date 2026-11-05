@@ -84,6 +84,9 @@ class AKShareData:
     def _timeout(self):
         return int(self.source_cfg.timeout or 30)
 
+    def _unavailable(self, factory):
+        return factory("akshare", error="akshare unavailable", issues=["akshare unavailable"])
+
     def _fetch(self, func, default=None, label="", retries=None, timeout=None):
         return safe_fetch(
             func,
@@ -159,6 +162,16 @@ class AKShareData:
                 error=f"invalid stock code: {stock_code!r}",
                 issues=["invalid stock code"],
             )
+        if not self.is_available():
+            if allow_fallback:
+                fallback = self._fallback_history(code, start, end, period_key, adj)
+                if fallback is not None and validate_ohlcv(fallback)[0]:
+                    return fallback
+            return empty_ohlcv(
+                "akshare",
+                error="akshare unavailable",
+                issues=["akshare unavailable"],
+            )
 
         key = ("history", code, start, end, period_key, adj)
         cache_key = make_cache_key("AKShareData", *key)
@@ -166,7 +179,11 @@ class AKShareData:
         if cached is not None and validate_ohlcv(cached)[0]:
             return cached
 
-        df = self._fetch_history(code, start, end, period_key, adj)
+        try:
+            df = self._fetch_history(code, start, end, period_key, adj)
+        except Exception as exc:
+            logger.warning("AKShare 历史拉取异常 %s: %s", code, exc)
+            df = empty_ohlcv("akshare", error=str(exc), issues=["fetch failed"])
         ok, issues = validate_ohlcv(df)
         if ok:
             self.cache.set(cache_key, df, ttl=self.cache_ttl)
@@ -244,6 +261,8 @@ class AKShareData:
                 return empty_quotes("akshare")
             return normalize_quotes(raw, source="akshare", market_cap_unit="yuan")
 
+        if not self.is_available():
+            return self._unavailable(empty_quotes)
         if force:
             return loader()
         return self._cached(("spot_snapshot",), self.ttl_realtime, loader, empty_quotes("akshare"))
@@ -252,6 +271,17 @@ class AKShareData:
         """
         股票列表。优先返回带行情字段的快照，便于筛选器按市值/涨跌幅/成交量过滤。
         """
+        if not self.is_available():
+            if allow_fallback and self.config.fallback:
+                try:
+                    from .tushare_data import TuShareData
+
+                    other = TuShareData(self.config)
+                    if other.is_available():
+                        return other.get_stock_list(exchange, allow_fallback=False)
+                except Exception as exc:
+                    logger.warning("股票列表回退失败: %s", exc)
+            return self._unavailable(empty_list)
 
         def loader():
             spot = self.get_spot_snapshot()
@@ -288,7 +318,11 @@ class AKShareData:
         """单只股票实时行情，至少包含 price 列（投资组合页依赖）。"""
         code = normalize_stock_code(stock_code)
         if not code:
-            return empty_quotes("akshare")
+            return empty_quotes(
+                "akshare",
+                error=f"invalid stock code: {stock_code!r}",
+                issues=["invalid stock code"],
+            )
 
         spot = self.get_spot_snapshot()
         if spot is not None and not spot.empty and "code" in spot.columns:
@@ -297,6 +331,8 @@ class AKShareData:
                 return stamp_frame(row.reset_index(drop=True), "akshare")
 
         def loader():
+            if not self.is_available():
+                return self._unavailable(empty_quotes)
             ak = self._client()
             for api_name, kwargs in (
                 ("stock_bid_ask_em", {"symbol": code}),
@@ -330,10 +366,19 @@ class AKShareData:
                     }
                 )
                 return normalize_quotes(fallback, source=fallback["source"].iloc[0])
+        if quote is None or quote.empty:
+            issues = list((quote.attrs.get("issues") if quote is not None else None) or ["quote unavailable"])
+            return empty_quotes(
+                "akshare",
+                error=(quote.attrs.get("error") if quote is not None else None) or "quote unavailable",
+                issues=issues,
+            )
         return quote
 
     def get_market_overview(self, light=False):
         """涨跌分布，列：type, count。默认先乐咕再快照；light=True 不打全市场。"""
+        if not self.is_available():
+            return self._unavailable(empty_overview)
 
         def from_spot():
             spot = self.get_spot_snapshot()
@@ -384,11 +429,13 @@ class AKShareData:
         if (overview is None or overview.empty) and not light:
             overview = from_spot()
         if overview is None or overview.empty:
-            return empty_overview("akshare")
+            return empty_overview("akshare", issues=["overview unavailable"])
         return overview
 
     def get_index_quotes(self):
         """主要 A 股指数实时行情。"""
+        if not self.is_available():
+            return self._unavailable(empty_index)
 
         def loader():
             ak = self._client()
@@ -430,6 +477,10 @@ class AKShareData:
 
     def get_industry_boards(self):
         """行业板块行情（东财）。"""
+        if not self.is_available():
+            return stamp_frame(
+                pd.DataFrame(), "akshare", error="akshare unavailable", issues=["akshare unavailable"]
+            )
 
         def loader():
             ak = self._client()
@@ -457,6 +508,8 @@ class AKShareData:
 
     def get_fund_flow(self, indicator="今日"):
         """行业资金流向。列：name, net_inflow, change_pct。"""
+        if not self.is_available():
+            return self._unavailable(empty_flow)
 
         def loader():
             ak = self._client()
@@ -509,6 +562,10 @@ class AKShareData:
 
     def get_northbound_flow(self):
         """北向资金净流入（若接口可用）。"""
+        if not self.is_available():
+            return stamp_frame(
+                pd.DataFrame(), "akshare", error="akshare unavailable", issues=["akshare unavailable"]
+            )
 
         def loader():
             ak = self._client()
@@ -534,6 +591,13 @@ class AKShareData:
 
     def get_trade_calendar(self, start_date=None, end_date=None):
         """交易日历，列：date, is_open。"""
+        if not self.is_available():
+            return stamp_frame(
+                pd.DataFrame(columns=["date", "is_open"]),
+                "akshare",
+                error="akshare unavailable",
+                issues=["akshare unavailable"],
+            )
 
         def loader():
             ak = self._client()
@@ -573,6 +637,8 @@ class AKShareData:
 
     def get_halted_stocks(self):
         """停牌列表。"""
+        if not self.is_available():
+            return self._unavailable(empty_list)
 
         def loader():
             ak = self._client()
@@ -600,7 +666,9 @@ class AKShareData:
         """个股概况，返回 dict。"""
         code = normalize_stock_code(stock_code)
         if not code:
-            return {}
+            return {"code": stock_code, "source": "akshare", "available": False, "error": "invalid stock code"}
+        if not self.is_available():
+            return {"code": code, "source": "akshare", "available": False, "error": "akshare unavailable"}
 
         def loader():
             info = {"code": code, "source": "akshare", "exchange": None, "board": None}

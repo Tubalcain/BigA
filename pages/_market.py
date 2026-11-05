@@ -17,12 +17,18 @@ tab1, tab2, tab3 = st.tabs(["🌍 市场概况", "📈 涨跌统计", "💰 资�
 
 
 def _load_client():
-    from src.data import get_data_source
+    from src.data import get_active_client
 
-    client = get_data_source(st.session_state.get("data_source", "akshare"))
-    if not client.is_available():
-        client = get_data_source("akshare")
-    return client
+    return get_active_client(st.session_state.get("data_source", "akshare"))
+
+
+def _empty_reason(frame, fallback=""):
+    from src.data import describe_data_problems
+
+    msg = describe_data_problems(frame)
+    if msg and msg != "empty frame":
+        return msg
+    return fallback
 
 
 def _index_metric(column, indices, keyword, label):
@@ -80,6 +86,9 @@ with tab1:
             st.dataframe(overview[["type", "count"]], use_container_width=True, hide_index=True)
         else:
             st.warning("未能获取市场概况数据")
+            reason = _empty_reason(overview)
+            if reason:
+                st.caption(reason)
 
         boards = ak_data.get_industry_boards()
         if boards is not None and not boards.empty:
@@ -115,6 +124,9 @@ with tab2:
 
         if df is None or df.empty:
             st.warning("未能获取实时行情，无法生成涨跌排行。")
+            reason = _empty_reason(df)
+            if reason:
+                st.caption(reason)
         else:
             sort_map = {"涨跌幅": "change_pct", "成交量": "volume", "成交额": "amount"}
             sort_col = sort_map[sort_by]
@@ -150,6 +162,9 @@ with tab3:
             st.caption(f"数据来源: {flow.attrs.get('source', 'akshare')} | 净流入单位视上游接口而定")
         else:
             st.info("资金流向接口暂时不可用（源站限流或字段变更时会自动降级）。")
+            reason = _empty_reason(flow)
+            if reason:
+                st.caption(reason)
 
         if north is not None and not north.empty:
             st.markdown("#### 北向资金")

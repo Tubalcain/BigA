@@ -26,14 +26,20 @@ with st.sidebar:
     cost_price = st.number_input("成本价", min_value=0.01, value=12.0, step=0.1)
     
     if st.button("➕ 添加持仓", type="primary", use_container_width=True):
-        st.session_state.portfolio.append({
-            'code': stock_code,
-            'name': stock_name,
-            'quantity': quantity,
-            'cost_price': cost_price
-        })
-        st.success(f"✓ 已添加 {stock_name}")
-        st.rerun()
+        from src.data.quality import normalize_stock_code
+
+        code = normalize_stock_code(stock_code)
+        if not code:
+            st.error("请输入 6 位股票代码（例如 000001，也可写 000001.SZ）")
+        else:
+            st.session_state.portfolio.append({
+                'code': code,
+                'name': stock_name,
+                'quantity': quantity,
+                'cost_price': cost_price
+            })
+            st.success(f"✓ 已添加 {stock_name}")
+            st.rerun()
     
     if st.button("🗑️ 清空持仓", type="secondary", use_container_width=True):
         st.session_state.portfolio = []
@@ -43,23 +49,29 @@ with st.sidebar:
 if len(st.session_state.portfolio) > 0:
     try:
         from src.analysis.portfolio import PortfolioAnalyzer
-        from src.data import get_data_source
+        from src.data import get_active_client
         
         analyzer = PortfolioAnalyzer(st.session_state.portfolio)
-        ak_data = get_data_source(st.session_state.get("data_source", "akshare"))
-        if not ak_data.is_available():
-            ak_data = get_data_source("akshare")
+        ak_data = get_active_client(st.session_state.get("data_source", "akshare"))
         
         # 获取当前价格
         current_prices = {}
+        missing_quotes = []
         with st.spinner("正在获取最新价格..."):
             for pos in st.session_state.portfolio:
                 quote = ak_data.get_realtime_quote(pos['code'])
-                if not quote.empty and 'price' in quote.columns:
-                    current_prices[pos['code']] = quote['price'].iloc[0]
+                price = None
+                if quote is not None and not quote.empty and 'price' in quote.columns:
+                    raw_price = quote['price'].iloc[0]
+                    if pd.notna(raw_price) and float(raw_price) > 0:
+                        price = float(raw_price)
+                if price is not None:
+                    current_prices[pos['code']] = price
                 else:
-                    # 如果没有实时数据，使用成本价
                     current_prices[pos['code']] = pos['cost_price']
+                    missing_quotes.append(str(pos.get('code') or pos.get('name') or ''))
+        if missing_quotes:
+            st.warning("以下持仓没有有效报价，暂用成本价计算市值：" + "、".join(missing_quotes))
         
         # 计算投资组合价值
         portfolio_info = analyzer.calculate_portfolio_value(current_prices)

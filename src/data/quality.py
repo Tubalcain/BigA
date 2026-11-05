@@ -473,6 +473,9 @@ def normalize_quotes(df, source=None, market_cap_unit="yuan"):
 
     if "code" in work.columns:
         work["code"] = work["code"].map(normalize_stock_code)
+        work = work[work["code"].astype(str).str.len() == 6]
+        if work.empty:
+            return empty_quotes(source, issues=["no valid stock codes"])
     if "price" not in work.columns and "close" in work.columns:
         work["price"] = work["close"]
 
@@ -517,6 +520,9 @@ def normalize_stock_list(df, source=None):
     work = rename_columns(df.copy())
     if "code" in work.columns:
         work["code"] = work["code"].map(normalize_stock_code)
+        work = work[work["code"].astype(str).str.len() == 6]
+        if work.empty:
+            return empty_list(source, issues=["no valid stock codes"])
         work["exchange"] = work["code"].map(infer_exchange)
         names = work["name"] if "name" in work.columns else pd.Series([""] * len(work))
         if "board" not in work.columns:
@@ -582,20 +588,26 @@ def normalize_adjust(adjust):
 
 
 def filter_date_range(df, start=None, end=None):
+    """按日期裁剪；若起止颠倒则交换，并在 attrs['date_range_swapped'] 标记。"""
     if df is None or df.empty or "date" not in df.columns:
         return df
     work = df
     start_key = compact_date(start)
     end_key = compact_date(end)
-    if start_key:
-        start_ts = pd.to_datetime(start_key, format="%Y%m%d", errors="coerce")
-        if pd.notna(start_ts):
-            work = work[work["date"] >= start_ts]
-    if end_key:
-        end_ts = pd.to_datetime(end_key, format="%Y%m%d", errors="coerce")
-        if pd.notna(end_ts):
-            work = work[work["date"] <= end_ts]
-    return work.reset_index(drop=True) if work is not df else work
+    start_ts = pd.to_datetime(start_key, format="%Y%m%d", errors="coerce") if start_key else pd.NaT
+    end_ts = pd.to_datetime(end_key, format="%Y%m%d", errors="coerce") if end_key else pd.NaT
+    swapped = bool(pd.notna(start_ts) and pd.notna(end_ts) and start_ts > end_ts)
+    if swapped:
+        start_ts, end_ts = end_ts, start_ts
+    if pd.notna(start_ts):
+        work = work[work["date"] >= start_ts]
+    if pd.notna(end_ts):
+        work = work[work["date"] <= end_ts]
+    if work is not df:
+        work = work.reset_index(drop=True)
+    if swapped:
+        work.attrs["date_range_swapped"] = True
+    return work
 
 
 def enforce_ohlcv_schema(df, source=None):
@@ -639,15 +651,47 @@ def prepare_ohlcv(
         drop_outliers=drop_outliers,
     )
     work = filter_date_range(work, start, end)
+    swapped = bool(work.attrs.get("date_range_swapped"))
     work = enforce_ohlcv_schema(work, source=source)
     ok, issues = validate_ohlcv(work)
+    issues = list(issues)
+    if swapped:
+        issues.append("start/end dates swapped")
+        work.attrs["date_range_swapped"] = True
     work.attrs["ok"] = ok
     work.attrs["issues"] = issues
     if error:
         work.attrs["error"] = error
     if not ok and work.empty:
-        return empty_ohlcv(source, error=error, issues=issues)
+        extra = issues or ["empty frame"]
+        if swapped:
+            extra = ["start/end dates swapped"] + [i for i in extra if i != "start/end dates swapped"]
+        return empty_ohlcv(source, error=error, issues=extra)
     return work
+
+
+def describe_data_problems(df):
+    """把 attrs 里的 error / issues 收成一行，给页面空态用。"""
+    if df is None:
+        return "无数据"
+    parts = []
+    error = df.attrs.get("error")
+    if error:
+        parts.append(str(error))
+    issues = df.attrs.get("issues") or []
+    for item in issues:
+        text = str(item)
+        if text and text not in parts:
+            parts.append(text)
+    if not parts and (df.empty if hasattr(df, "empty") else True):
+        return "empty frame"
+    return "；".join(parts)
+
+
+def outlier_count(df):
+    if df is None or df.empty or "is_outlier" not in df.columns:
+        return 0
+    return int(pd.Series(df["is_outlier"]).fillna(False).astype(bool).sum())
 
 
 def attach_meta(df, **meta):

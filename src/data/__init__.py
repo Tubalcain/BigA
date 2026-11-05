@@ -11,6 +11,7 @@ OpenBB 未接入，仅作为可选的未来扩展。
 
 from .akshare_data import AKShareData, AKShareIndicator
 from .config import get_data_config, load_app_config
+from .quality import describe_data_problems, outlier_count
 from .tushare_data import TuShareData
 
 __all__ = [
@@ -18,8 +19,11 @@ __all__ = [
     "AKShareIndicator",
     "TuShareData",
     "get_data_source",
+    "get_active_client",
     "get_data_config",
     "load_app_config",
+    "describe_data_problems",
+    "outlier_count",
 ]
 
 
@@ -36,3 +40,18 @@ def get_data_source(name=None):
     if source in ("tushare", "ts"):
         return TuShareData(cfg)
     return AKShareData(cfg)
+
+
+def get_active_client(name=None):
+    """
+    给页面用的客户端：先按 name / primary 取源，不可用则落到 AKShare。
+    与 get_data_source 不同，这里会换源，避免每个页面复制同一段降级逻辑。
+    """
+    client = get_data_source(name)
+    if client.is_available():
+        return client
+    if getattr(client, "name", "") != "akshare":
+        fallback = get_data_source("akshare")
+        if fallback.is_available():
+            return fallback
+    return client

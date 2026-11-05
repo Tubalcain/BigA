@@ -312,7 +312,7 @@ class TuShareData:
     def get_stock_list(self, exchange="所有", allow_fallback=True):
         def loader():
             if not self.is_available():
-                return empty_list("tushare")
+                return empty_list("tushare", error="tushare unavailable", issues=["tushare unavailable"])
             raw = self._fetch(
                 lambda: self._pro.stock_basic(
                     list_status="L",
@@ -348,9 +348,13 @@ class TuShareData:
         """TuShare 免费接口无真正实时，取最近一个交易日 daily + daily_basic。"""
         code = normalize_stock_code(stock_code)
         if not code:
-            return empty_quotes("tushare")
+            return empty_quotes(
+                "tushare",
+                error=f"invalid stock code: {stock_code!r}",
+                issues=["invalid stock code"],
+            )
         if not self.is_available():
-            return empty_quotes("tushare")
+            return empty_quotes("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
             end = pd.Timestamp.now().strftime("%Y%m%d")
@@ -439,7 +443,7 @@ class TuShareData:
 
     def get_index_quotes(self):
         if not self.is_available():
-            return empty_index("tushare")
+            return empty_index("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
             mapping = {
@@ -504,7 +508,7 @@ class TuShareData:
 
     def get_fund_flow(self, indicator="今日"):
         if not self.is_available():
-            return empty_flow("tushare")
+            return empty_flow("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
             trade_date = self._latest_open_date()
@@ -563,7 +567,7 @@ class TuShareData:
 
     def get_halted_stocks(self):
         if not self.is_available():
-            return empty_list("tushare")
+            return empty_list("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
             trade_date = self._latest_open_date()
