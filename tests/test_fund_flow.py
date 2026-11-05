@@ -31,6 +31,7 @@ from src.analysis.fund_flow import (
     stock_flow_notes,
     summarize_rank,
     unit_caption,
+    _divergence_conflicts,
 )
 from src.data.quality import (
     attach_rank_scope,
@@ -410,15 +411,23 @@ class FlowBiasTests(unittest.TestCase):
         self.assertTrue(any("不计入市场合计" in line or "重叠" in line for line in bias["evidence"]))
         self.assertFalse(any("全市场净流入" in line for line in bias["evidence"]))
 
-    def test_bad_quality_zeroes_score_delta(self):
+    def test_bad_leg_does_not_zero_good_legs(self):
         market = self._series([80, 90, 100, 110, 120, 130])
+        north = self._series([-50, -60, -70, -80, -90, -100], col="net_inflow")
+        north.attrs["ok"] = False
+        north.attrs["issues"] = ["all-zero amounts"]
         stock = self._series([20, 30, 40, 50, 60, 70])
-        stock.attrs["ok"] = False
-        stock.attrs["issues"] = ["all-zero amounts"]
-        bias = fund_flow_bias(market_df=market, stock_flow=stock)
-        self.assertFalse(bias["quality_ok"])
-        self.assertEqual(bias["score_delta"], 0)
-        self.assertTrue(any("质量" in line for line in bias["evidence"]))
+        bias = fund_flow_bias(market_df=market, north_df=north, stock_flow=stock)
+        self.assertIn("north", bias.get("dropped_legs") or [])
+        self.assertFalse(bias["components"]["north"]["quality_ok"])
+        self.assertGreater(bias["score_delta"], 0)
+        self.assertEqual(bias["bias"], "偏多")
+        self.assertTrue(any("北向" in line and "不计入" in line for line in bias["evidence"]))
+        all_bad = self._series([20, 30, 40, 50, 60, 70])
+        all_bad.attrs["ok"] = False
+        emptyish = fund_flow_bias(stock_flow=all_bad, north_df=north)
+        self.assertEqual(emptyish["score_delta"], 0)
+        self.assertFalse(emptyish["quality_ok"])
 
     def test_missing_inputs_are_neutral(self):
         bias = fund_flow_bias()
@@ -441,14 +450,32 @@ class FlowBiasTests(unittest.TestCase):
         self.assertIn("关注反弹条件", rebound)
         self.assertNotIn("吸筹", rebound)
 
+    def test_divergence_conflict_is_split(self):
+        self.assertTrue(_divergence_conflicts("价涨资出", stock_sign=1, vote_signs=[1]))
+        self.assertFalse(_divergence_conflicts("价涨资出", stock_sign=-1, vote_signs=[-1]))
+        self.assertTrue(_divergence_conflicts("价跌资进", stock_sign=-1, vote_signs=[-1]))
+        dates = pd.date_range("2024-01-01", periods=8, freq="D")
+        price = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
+        stock = pd.DataFrame({"date": dates, "main_net_inflow": [100, 80, -50, -80, -90, -100, -120, -150]})
+        market = self._series([80, 90, 100, 110, 120, 130, 140, 150])
+        bias = fund_flow_bias(market_df=market, stock_flow=stock, price_df=price)
+        self.assertEqual(bias["bias"], "分化")
+        self.assertEqual(bias["score_delta"], 0)
+        blob = " ".join(bias["evidence"])
+        self.assertIn("价涨资出", blob)
+        self.assertIn("追高风险", blob)
+        self.assertIn("分化", blob)
+        self.assertNotIn("派发", blob)
+        self.assertNotIn("吸筹", blob)
+
     def test_apply_fund_flow_bias_soft_score(self):
         rec = {
-            "score": 4,
-            "recommendation": "持有",
-            "action": "HOLD",
+            "score": 9,
+            "recommendation": "买入",
+            "action": "BUY",
             "confidence": "中等",
-            "reason": "信号不明确",
-            "analysis_notes": ["技术面：持有"],
+            "reason": "买入信号明显",
+            "analysis_notes": ["技术面：买入"],
         }
         bull = fund_flow_bias(
             market_df=self._series([80, 90, 100, 110, 120, 130]),
@@ -456,17 +483,15 @@ class FlowBiasTests(unittest.TestCase):
             stock_flow=self._series([20, 30, 40, 50, 60, 70]),
         )
         out = apply_fund_flow_bias(rec, bull, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5)
-        self.assertEqual(out["score_raw"], 4)
+        self.assertEqual(out["score_raw"], 9)
+        self.assertEqual(out["tech_score"], 9)
+        self.assertEqual(out["tech_confidence"], "中等")
+        self.assertEqual(out["confidence"], "中等")
         self.assertGreater(out["fund_score_delta"], 0)
-        self.assertEqual(out["score"], 4 + out["fund_score_delta"])
-        self.assertEqual(out["action"], "BUY")
-        self.assertTrue(any("资金面倾向" in n for n in out["analysis_notes"]))
-        bad = dict(bull)
-        bad["quality_ok"] = False
-        bad["score_delta"] = 2
-        zeroed = apply_fund_flow_bias(rec, bad)
-        self.assertEqual(zeroed["fund_score_delta"], 0)
-        self.assertEqual(zeroed["score"], 4)
+        self.assertEqual(out["score"], 9 + out["fund_score_delta"])
+        self.assertEqual(out["recommendation"], "强烈买入")
+        self.assertEqual(out["blended_confidence"], "高")
+        self.assertTrue(any("技术" in n and "资金" in n for n in out["analysis_notes"]))
 
 
 class FlowAdapterEmptyTests(unittest.TestCase):

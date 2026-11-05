@@ -53,11 +53,10 @@ def _render_fund_bias_card(bias):
 
     view = bias_display(bias)
     st.markdown(f"#### {view['title']}")
-    st.caption(view["disclaimer"])
-    c1, c2, c3 = st.columns(3)
+    st.caption(view["disclaimer"] + "。本页不改交易评分。")
+    c1, c2 = st.columns(2)
     c1.metric("倾向", view["bias"])
     c2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
-    c3.metric("软评分", view["score_delta"])
     for line in view["evidence"][:8]:
         st.caption("· " + line)
 

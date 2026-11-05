@@ -527,6 +527,7 @@ def empty_fund_bias(reason="资金数据不足，不下倾向"):
         "score_delta": 0.0,
         "components": {},
         "quality_ok": True,
+        "dropped_legs": [],
         "label": "资金面倾向（1–5日）",
         "disclaimer": "资金面倾向，不是涨跌预测",
     }
@@ -677,6 +678,26 @@ def sector_rotation_stats(rank_df, column="net_inflow", top_n=5):
     }
 
 
+def _divergence_implied_sign(note):
+    """价涨资出≈资金流出(-1)，价跌资进≈资金流入(+1)。同向已有明确票，不走这里。"""
+    if note == "价涨资出":
+        return -1
+    if note == "价跌资进":
+        return 1
+    return 0
+
+
+def _divergence_conflicts(note, stock_sign=0, vote_signs=None):
+    """背离含义与个股腿或其他资金票冲突时为 True。"""
+    implied = _divergence_implied_sign(note)
+    if not implied:
+        return False
+    if stock_sign and int(stock_sign) != implied:
+        return True
+    others = [int(sign) for sign in (vote_signs or []) if sign]
+    return bool(others) and any(sign != implied for sign in others)
+
+
 def _confidence_label(value):
     if value >= 0.67:
         return "高"
@@ -704,22 +725,21 @@ def fund_flow_bias(
 ):
     """
     合成短周期资金面倾向。返回偏多/偏空/中性/分化，不是涨跌预测。
-    质量不合格的腿权重为 0；若有不合格输入，score_delta 为 0。
+    质量不合格的腿只剔除该腿；score_delta=0 仅当没有可用投票腿，或倾向为中性/分化，或信心过低。
     """
     result = empty_fund_bias()
     evidence = []
     votes = []
     components = {}
-    quality_ok = True
+    dropped_legs = []
     caution = False
 
     def _take(name, df):
-        nonlocal quality_ok
         if not _frame_has_rows(df):
             components[name] = _leg_component(available=False)
             return False
         if not _frame_quality_ok(df):
-            quality_ok = False
+            dropped_legs.append(name)
             components[name] = _leg_component(available=True, quality_ok=False)
             evidence.append(f"{_LEG_CN.get(name, name)}数据质量不足，该腿不计入")
             return False
@@ -818,17 +838,21 @@ def fund_flow_bias(
     div_note = latest_divergence_note(price_df, stock_flow) if price_df is not None else ""
     reading = divergence_reading(div_note, streak=stock_streak or None)
     div_sign = 0
-    if div_note in ("价资同向（上涨）",):
+    div_implied = _divergence_implied_sign(div_note)
+    if div_note == "价资同向（上涨）":
         div_sign = 1
-    elif div_note in ("价资同向（下跌）",):
+    elif div_note == "价资同向（下跌）":
         div_sign = -1
-    elif div_note in ("价涨资出", "价跌资进"):
+    elif div_implied:
         caution = True
     if reading:
         evidence.append(reading)
     if price_df is not None or div_note:
         components["divergence"] = _leg_component(
-            sign=div_sign, available=bool(div_note), note=div_note, reading=reading
+            sign=div_sign or div_implied,
+            available=bool(div_note),
+            note=div_note,
+            reading=reading,
         )
         if div_sign:
             votes.append(("divergence", div_sign, 0.8))
@@ -836,14 +860,26 @@ def fund_flow_bias(
     if not evidence:
         return result
 
+    stock_sign = int((components.get("stock") or {}).get("sign") or 0)
+    vote_signs = [sign for _, sign, _ in votes if sign]
+    div_conflict = _divergence_conflicts(div_note, stock_sign, vote_signs)
+    if div_conflict and div_implied:
+        votes.append(("divergence", div_implied, 0.8))
+        components["divergence"]["sign"] = int(div_implied)
+        evidence.append("价资背离与资金方向冲突，倾向记为分化")
+
     bull = sum(1 for _, sign, _ in votes if sign > 0)
     bear = sum(1 for _, sign, _ in votes if sign < 0)
     n_avail = sum(1 for item in components.values() if item.get("available") and item.get("quality_ok"))
+    usable_votes = bull + bear
     weighted = sum(sign * weight for _, sign, weight in votes)
+    # 有可用投票腿则整体仍可用于软评分；缺腿或坏腿不算全场不合格。
+    quality_ok = usable_votes > 0 or not dropped_legs
 
     if bull and bear:
         bias = BIAS_SPLIT
-        evidence.append("资金腿方向冲突，倾向记为分化")
+        if not any("分化" in line for line in evidence):
+            evidence.append("资金腿方向冲突，倾向记为分化")
         confidence = min(0.45, 0.18 + 0.06 * n_avail)
     elif bull and not bear:
         bias = BIAS_BULL
@@ -855,20 +891,15 @@ def fund_flow_bias(
         bias = BIAS_NEUTRAL
         confidence = 0.2 if n_avail else 0.0
 
-    if caution:
+    if caution and not div_conflict:
         confidence *= 0.85
-    if not quality_ok:
-        confidence *= 0.4
     confidence = max(0.0, min(1.0, float(confidence)))
 
-    if (not quality_ok) or bias in (BIAS_NEUTRAL, BIAS_SPLIT) or confidence < 0.25:
+    if usable_votes == 0 or bias in (BIAS_NEUTRAL, BIAS_SPLIT) or confidence < 0.25:
         score_delta = 0.0
     else:
         magnitude = 2.0 if confidence >= 0.6 else 1.0
         score_delta = magnitude if bias == BIAS_BULL else -magnitude
-
-    if not quality_ok:
-        evidence.append("存在质量不合格数据，交易软评分为 0")
 
     result.update(
         {
@@ -880,6 +911,7 @@ def fund_flow_bias(
             "score_delta": float(score_delta),
             "components": components,
             "quality_ok": quality_ok,
+            "dropped_legs": list(dropped_legs),
             "net_vote": float(weighted),
         }
     )
@@ -897,6 +929,7 @@ def bias_display(bias):
         "confidence_label": payload.get("confidence_label") or "低",
         "confidence_pct": f"{conf:.0%}",
         "score_delta": f"{float(payload.get('score_delta') or 0):+.1f}",
+        "score_delta_label": "评分贡献",
         "evidence": list(payload.get("evidence") or []),
         "reading": ((payload.get("components") or {}).get("divergence") or {}).get("reading") or "",
         "horizon": payload.get("horizon") or BIAS_HORIZON,
@@ -917,16 +950,17 @@ def _action_from_score(score, strong_buy, buy, hold_floor, sell_floor):
 
 def apply_fund_flow_bias(recommendation, bias=None, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5):
     """
-    把资金面 score_delta 软加到交易评分。质量不合格或缺失时加 0。
+    把资金面 score_delta 软加到交易评分。信任 bias.score_delta（坏腿已在合成时剔除）。
+    保留技术信心 tech_confidence，不按总分阈值覆盖引擎原信心。
     不改止损；若评分跨过阈值则同步更新 action。
     """
     rec = dict(recommendation or {})
     payload = bias or empty_fund_bias()
     raw = float(rec.get("score") or 0)
     delta = float(payload.get("score_delta") or 0)
-    if payload.get("quality_ok") is False:
-        delta = 0.0
     rec["score_raw"] = raw
+    rec["tech_score"] = raw
+    rec["tech_confidence"] = rec.get("confidence")
     rec["fund_score_delta"] = delta
     rec["fund_flow_bias"] = payload
     rec["score"] = raw + delta
@@ -934,17 +968,19 @@ def apply_fund_flow_bias(recommendation, bias=None, strong_buy=10, buy=5, hold_f
     notes.append(
         f"资金面倾向（{payload.get('horizon') or BIAS_HORIZON}）："
         f"{payload.get('bias') or BIAS_NEUTRAL}，"
-        f"信心{payload.get('confidence_label') or '低'}，软评分 {delta:+.1f}"
+        f"资金信心{payload.get('confidence_label') or '低'}，"
+        f"技术 {raw:+.1f} / 资金 {delta:+.1f}"
     )
     for line in payload.get("evidence") or []:
         notes.append(f"资金面：{line}")
     rec["analysis_notes"] = notes
-    action, action_code, confidence = _action_from_score(
+    action, action_code, blended_conf = _action_from_score(
         rec["score"], strong_buy, buy, hold_floor, sell_floor
     )
     rec["recommendation"] = action
     rec["action"] = action_code
-    rec["confidence"] = confidence
+    rec["blended_confidence"] = blended_conf
+    rec["confidence"] = rec["tech_confidence"]
     if delta:
         reason = rec.get("reason") or ""
         suffix = f"资金面软评分 {delta:+.1f}（倾向，非预测）"

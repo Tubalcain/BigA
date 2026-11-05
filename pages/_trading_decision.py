@@ -214,7 +214,7 @@ if analyze_btn or 'analyze' in st.session_state:
             else:
                 st.subheader("💡 核心交易建议")
             
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
             
             with col1:
                 action = recommendation['action']
@@ -225,30 +225,30 @@ if analyze_btn or 'analyze' in st.session_state:
                 else:
                     st.metric("推荐动作", "🟡 持有", delta="中性信号")
             
+            tech_score = recommendation.get("tech_score", recommendation.get("score_raw", recommendation["score"]))
+            fund_delta = recommendation.get("fund_score_delta", 0)
             with col2:
-                score = recommendation['score']
-                st.metric("综合评分", f"{score:.1f}", delta=f"{'+' if score >= 0 else ''}{score:.1f}分")
-            
+                st.metric("技术评分", f"{float(tech_score):.1f}")
             with col3:
-                confidence = recommendation['confidence']
-                st.metric("信心度", confidence)
-            
+                st.metric("资金软分", f"{float(fund_delta):+.1f}")
             with col4:
-                momentum_pct = momentum['percentage']
-                st.metric("动量得分", f"{momentum['score']}/15", 
-                         delta=f"{momentum_pct:.1f}%")
-            
+                score = recommendation['score']
+                st.metric("综合评分", f"{float(score):.1f}")
             with col5:
+                tech_conf = recommendation.get("tech_confidence", recommendation.get("confidence"))
+                st.metric("技术信心", tech_conf or "-")
+            with col6:
                 trend = trading_plan['trend']
                 st.metric("趋势状态", trend)
+            st.caption(f"动量 {momentum['score']}/15（{momentum['percentage']:.1f}%）。综合分 = 技术 {float(tech_score):.1f} + 资金 {float(fund_delta):+.1f}。")
 
             view = bias_display(flow_bias)
             st.markdown(f"##### {view['title']}")
             st.caption(view["disclaimer"])
             bc1, bc2, bc3 = st.columns(3)
             bc1.metric("倾向", view["bias"])
-            bc2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
-            bc3.metric("软评分", view["score_delta"])
+            bc2.metric("资金信心", view["confidence_label"], delta=view["confidence_pct"])
+            bc3.metric("资金软分", view["score_delta"])
             for line in view["evidence"][:6]:
                 st.caption("· " + line)
 
