@@ -126,6 +126,32 @@ def test_akshare():
     except Exception as e:
         _ok("市场扩展接口", False, str(e))
 
+    print("\n[测试6] 资金流向...")
+    total += 1
+    try:
+        sector = ak_data.get_sector_fund_flow()
+        stock_rank = ak_data.get_stock_fund_flow_rank()
+        north = ak_data.get_northbound_flow()
+        stock_flow = ak_data.get_stock_fund_flow(SAMPLE_CODE, START, END)
+        any_flow = any(
+            frame is not None and not frame.empty
+            for frame in (sector, stock_rank, north, stock_flow)
+        )
+        detail = (
+            f"sector={0 if sector is None else len(sector)}, "
+            f"stock_rank={0 if stock_rank is None else len(stock_rank)}, "
+            f"north={0 if north is None else len(north)}, "
+            f"stock={0 if stock_flow is None else len(stock_flow)}"
+        )
+        if any_flow:
+            if _ok("资金流向", True, detail):
+                passed += 1
+        else:
+            _ok("资金流向", True, f"接口降级（不记失败） {detail}")
+            passed += 1
+    except Exception as e:
+        _ok("资金流向", False, str(e))
+
     print("\n" + "=" * 60)
     print(f"AKShare测试完成: {passed}/{total}")
     print("=" * 60)

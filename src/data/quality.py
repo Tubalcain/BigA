@@ -65,7 +65,97 @@ OVERVIEW_COLUMNS = ["type", "count", "source"]
 
 INDEX_COLUMNS = ["code", "name", "price", "change", "change_pct", "volume", "amount", "source"]
 
-FLOW_COLUMNS = ["name", "net_inflow", "change_pct", "source"]
+# 排名表（行业 / 个股）。金额统一为万元。
+FLOW_COLUMNS = [
+    "code",
+    "name",
+    "flow_type",
+    "period",
+    "net_inflow",
+    "net_inflow_pct",
+    "main_net_inflow",
+    "super_large_net",
+    "large_net",
+    "medium_net",
+    "small_net",
+    "price",
+    "change_pct",
+    "source",
+]
+
+# 个股资金流时间序列。金额统一为万元。
+STOCK_FLOW_COLUMNS = [
+    "date",
+    "code",
+    "name",
+    "close",
+    "change_pct",
+    "net_inflow",
+    "main_net_inflow",
+    "main_net_pct",
+    "super_large_net",
+    "super_large_pct",
+    "large_net",
+    "large_pct",
+    "medium_net",
+    "medium_pct",
+    "small_net",
+    "small_pct",
+    "source",
+]
+
+# 北向 / 南向。金额统一为万元。
+CROSS_BORDER_COLUMNS = [
+    "date",
+    "direction",
+    "net_inflow",
+    "buy_amount",
+    "sell_amount",
+    "north_inflow",
+    "south_inflow",
+    "hgt",
+    "sgt",
+    "source",
+]
+
+# 市场级主力资金。金额统一为万元。
+MARKET_FLOW_COLUMNS = [
+    "date",
+    "main_net_inflow",
+    "main_net_pct",
+    "super_large_net",
+    "large_net",
+    "medium_net",
+    "small_net",
+    "sse_close",
+    "szse_close",
+    "source",
+]
+
+FLOW_MONEY_COLUMNS = [
+    "net_inflow",
+    "main_net_inflow",
+    "super_large_net",
+    "large_net",
+    "medium_net",
+    "small_net",
+    "buy_amount",
+    "sell_amount",
+    "north_inflow",
+    "south_inflow",
+    "hgt",
+    "sgt",
+]
+
+FLOW_PCT_COLUMNS = [
+    "net_inflow_pct",
+    "main_net_pct",
+    "super_large_pct",
+    "large_pct",
+    "medium_pct",
+    "small_pct",
+    "change_pct",
+]
 
 COLUMN_ALIASES = {
     "date": ["date", "日期", "trade_date", "datetime", "时间", "day"],
@@ -87,7 +177,24 @@ COLUMN_ALIASES = {
     "market_cap": ["market_cap", "total_mv", "总市值", "总市值(万元)"],
     "circ_mv": ["circ_mv", "流通市值", "流通市值(万元)"],
     "volume_ratio": ["volume_ratio", "量比"],
-    "net_inflow": ["net_inflow", "净流入", "主力净流入", "净额"],
+    "net_inflow": ["net_inflow", "净流入", "主力净流入", "净额", "north_money", "当日成交净买额"],
+    "main_net_inflow": ["main_net_inflow", "主力净流入-净额", "主力净流入"],
+    "main_net_pct": ["main_net_pct", "主力净流入-净占比", "主力净流入净占比"],
+    "net_inflow_pct": ["net_inflow_pct", "净占比", "净流入占比"],
+    "super_large_net": ["super_large_net", "超大单净流入-净额", "超大单净流入"],
+    "super_large_pct": ["super_large_pct", "超大单净流入-净占比"],
+    "large_net": ["large_net", "大单净流入-净额", "大单净流入"],
+    "large_pct": ["large_pct", "大单净流入-净占比"],
+    "medium_net": ["medium_net", "中单净流入-净额", "中单净流入"],
+    "medium_pct": ["medium_pct", "中单净流入-净占比"],
+    "small_net": ["small_net", "小单净流入-净额", "小单净流入"],
+    "small_pct": ["small_pct", "小单净流入-净占比"],
+    "buy_amount": ["buy_amount", "买入成交额", "买入金额"],
+    "sell_amount": ["sell_amount", "卖出成交额", "卖出金额"],
+    "north_inflow": ["north_inflow", "north_money", "北向资金", "北向净流入"],
+    "south_inflow": ["south_inflow", "south_money", "南向资金", "南向净流入"],
+    "hgt": ["hgt", "沪股通"],
+    "sgt": ["sgt", "深股通"],
     "type": ["type", "类型", "item", "项目"],
     "count": ["count", "数量", "家数"],
     "exchange": ["exchange", "交易所", "market"],
@@ -114,6 +221,23 @@ _NUMERIC_COLS = {
     "circ_mv",
     "volume_ratio",
     "net_inflow",
+    "net_inflow_pct",
+    "main_net_inflow",
+    "main_net_pct",
+    "super_large_net",
+    "super_large_pct",
+    "large_net",
+    "large_pct",
+    "medium_net",
+    "medium_pct",
+    "small_net",
+    "small_pct",
+    "buy_amount",
+    "sell_amount",
+    "north_inflow",
+    "south_inflow",
+    "hgt",
+    "sgt",
     "count",
 }
 
@@ -143,7 +267,44 @@ def empty_index(source=None, error=None, issues=None):
 
 
 def empty_flow(source=None, error=None, issues=None):
-    return stamp_frame(pd.DataFrame(columns=FLOW_COLUMNS), source, error=error, issues=issues)
+    return stamp_flow(
+        pd.DataFrame(columns=FLOW_COLUMNS),
+        source,
+        error=error,
+        issues=issues,
+        flow_type="rank",
+    )
+
+
+def empty_stock_flow(source=None, error=None, issues=None):
+    return stamp_flow(
+        pd.DataFrame(columns=STOCK_FLOW_COLUMNS),
+        source,
+        error=error,
+        issues=issues,
+        flow_type="stock",
+    )
+
+
+def empty_cross_border(source=None, error=None, issues=None, direction="northbound"):
+    return stamp_flow(
+        pd.DataFrame(columns=CROSS_BORDER_COLUMNS),
+        source,
+        error=error,
+        issues=issues,
+        flow_type="cross_border",
+        direction=direction,
+    )
+
+
+def empty_market_flow(source=None, error=None, issues=None):
+    return stamp_flow(
+        pd.DataFrame(columns=MARKET_FLOW_COLUMNS),
+        source,
+        error=error,
+        issues=issues,
+        flow_type="market",
+    )
 
 
 def stamp_frame(df, source=None, error=None, issues=None):
@@ -738,3 +899,570 @@ def attach_meta(df, **meta):
     for key, value in meta.items():
         df.attrs[key] = value
     return df
+
+
+# ---------------------------------------------------------------------------
+# 资金流向：列名清洗、单位换算、校验
+# ---------------------------------------------------------------------------
+
+_FLOW_PERIOD_PREFIXES = ("今日", "3日", "5日", "10日")
+
+_UNIT_TO_WAN = {
+    "yuan": 1 / 10000.0,
+    "元": 1 / 10000.0,
+    "wan": 1.0,
+    "万元": 1.0,
+    "yi": 10000.0,
+    "亿": 10000.0,
+    "亿元": 10000.0,
+    "baiwan": 100.0,
+    "百万": 100.0,
+    "百万元": 100.0,
+}
+
+FLOW_EXPLICIT_MAP = {
+    "主力净流入-净额": "main_net_inflow",
+    "主力净流入-净占比": "main_net_pct",
+    "超大单净流入-净额": "super_large_net",
+    "超大单净流入-净占比": "super_large_pct",
+    "大单净流入-净额": "large_net",
+    "大单净流入-净占比": "large_pct",
+    "中单净流入-净额": "medium_net",
+    "中单净流入-净占比": "medium_pct",
+    "小单净流入-净额": "small_net",
+    "小单净流入-净占比": "small_pct",
+    "净流入-净额": "net_inflow",
+    "当日成交净买额": "net_inflow",
+    "当日资金流入": "net_inflow",
+    "买入成交额": "buy_amount",
+    "卖出成交额": "sell_amount",
+    "历史累计净买额": "cumulative_net",
+    "north_money": "north_inflow",
+    "south_money": "south_inflow",
+    "net_mf_amount": "net_inflow",
+    "net_amount": "main_net_inflow",
+    "net_amount_rate": "net_inflow_pct",
+    "pct_change": "change_pct",
+    "value": "net_inflow",
+    "上证-收盘价": "sse_close",
+    "深证-收盘价": "szse_close",
+}
+
+_BUY_SELL_BUCKETS = (
+    ("buy_elg_amount", "sell_elg_amount", "super_large_net"),
+    ("buy_lg_amount", "sell_lg_amount", "large_net"),
+    ("buy_md_amount", "sell_md_amount", "medium_net"),
+    ("buy_sm_amount", "sell_sm_amount", "small_net"),
+)
+
+
+def stamp_flow(
+    df,
+    source=None,
+    error=None,
+    issues=None,
+    unit="万元",
+    flow_type=None,
+    period=None,
+    direction=None,
+):
+    """stamp_frame + 资金流元数据（单位 / 类型 / 周期）。"""
+    work = stamp_frame(df, source, error=error, issues=issues)
+    work.attrs["unit"] = unit or "万元"
+    if flow_type:
+        work.attrs["flow_type"] = flow_type
+    if period:
+        work.attrs["period"] = period
+    if direction:
+        work.attrs["direction"] = direction
+    return work
+
+
+def normalize_flow_indicator(indicator):
+    """今日 / 3日 / 5日 / 10日，兼容 1d、daily 等写法。"""
+    if indicator is None:
+        return "今日"
+    text = str(indicator).strip()
+    mapping = {
+        "今日": "今日",
+        "今天": "今日",
+        "1日": "今日",
+        "1d": "今日",
+        "d1": "今日",
+        "daily": "今日",
+        "day": "今日",
+        "3日": "3日",
+        "3d": "3日",
+        "d3": "3日",
+        "5日": "5日",
+        "5d": "5日",
+        "d5": "5日",
+        "10日": "10日",
+        "10d": "10日",
+        "d10": "10日",
+    }
+    return mapping.get(text, mapping.get(text.lower(), text or "今日"))
+
+
+def normalize_sector_type(sector_type):
+    """行业资金流 / 概念资金流 / 地域资金流。"""
+    if sector_type is None:
+        return "行业资金流"
+    text = str(sector_type).strip()
+    mapping = {
+        "行业": "行业资金流",
+        "行业资金流": "行业资金流",
+        "industry": "行业资金流",
+        "概念": "概念资金流",
+        "概念资金流": "概念资金流",
+        "concept": "概念资金流",
+        "地域": "地域资金流",
+        "地域资金流": "地域资金流",
+        "region": "地域资金流",
+        "area": "地域资金流",
+    }
+    return mapping.get(text, mapping.get(text.lower(), text or "行业资金流"))
+
+
+def sector_type_short(sector_type):
+    full = normalize_sector_type(sector_type)
+    return {
+        "行业资金流": "行业",
+        "概念资金流": "概念",
+        "地域资金流": "地域",
+    }.get(full, full)
+
+
+def canonicalize_flow_columns(df):
+    """去掉东财排名表的 今日/3日/5日/10日 列名前缀。"""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    mapping = {}
+    for col in df.columns:
+        name = str(col).strip()
+        stripped = name
+        for prefix in _FLOW_PERIOD_PREFIXES:
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix) :]
+                break
+        if stripped and stripped != name:
+            mapping[col] = stripped
+    if mapping:
+        df = df.rename(columns=mapping)
+    return df
+
+
+def apply_explicit_column_map(df, mapping=None):
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    mapping = mapping or FLOW_EXPLICIT_MAP
+    rename = {}
+    for raw, standard in mapping.items():
+        if raw in df.columns and standard not in df.columns:
+            rename[raw] = standard
+    return df.rename(columns=rename) if rename else df
+
+
+def derive_bucket_nets(df):
+    """TuShare moneyflow：买卖额差 → 超大/大/中/小单净额，主力 = 超大 + 大。"""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    work = df.copy()
+    for buy, sell, dest in _BUY_SELL_BUCKETS:
+        if dest not in work.columns and buy in work.columns and sell in work.columns:
+            work[dest] = to_numeric(work[buy]) - to_numeric(work[sell])
+    if "main_net_inflow" not in work.columns and {"super_large_net", "large_net"}.issubset(work.columns):
+        work["main_net_inflow"] = to_numeric(work["super_large_net"]) + to_numeric(work["large_net"])
+    return work
+
+
+def infer_amount_unit(series, context="generic"):
+    """
+    根据量级猜测金额单位。北向单日常见量级约数十亿，个股主力常见百万～数十亿（元）。
+    适配器能确定单位时应显式传入，不要依赖本函数。
+    """
+    values = to_numeric(series).replace([np.inf, -np.inf], np.nan).dropna()
+    if values.empty:
+        return "wan"
+    med = float(values.abs().median())
+    if context in ("northbound", "southbound", "cross_border"):
+        if med >= 1e8:
+            return "yuan"
+        if med >= 20000:
+            return "wan"
+        if med >= 1500:
+            return "baiwan"
+        if med <= 400:
+            return "yi"
+        return "wan"
+    if med >= 1e7:
+        return "yuan"
+    return "wan"
+
+
+def scale_to_wan(df, columns, unit="yuan"):
+    """把金额列换算为万元。unit=auto 时不处理（先 infer 再调）。"""
+    if df is None or df.empty:
+        return df
+    key = str(unit or "wan").strip()
+    factor = _UNIT_TO_WAN.get(key, _UNIT_TO_WAN.get(key.lower(), None))
+    if factor is None or factor == 1.0:
+        return df
+    work = df.copy()
+    for col in columns:
+        if col in work.columns:
+            work[col] = to_numeric(work[col]) * factor
+    return work
+
+
+def _fill_flow_aliases(work):
+    if "net_inflow" not in work.columns and "main_net_inflow" in work.columns:
+        work["net_inflow"] = work["main_net_inflow"]
+    if "main_net_inflow" not in work.columns and "net_inflow" in work.columns:
+        work["main_net_inflow"] = work["net_inflow"]
+    if "net_inflow_pct" not in work.columns and "main_net_pct" in work.columns:
+        work["net_inflow_pct"] = work["main_net_pct"]
+    if "main_net_pct" not in work.columns and "net_inflow_pct" in work.columns:
+        work["main_net_pct"] = work["net_inflow_pct"]
+    return work
+
+
+def _resolve_amount_unit(work, amount_unit, context, seed_columns):
+    if amount_unit not in (None, "", "auto"):
+        return amount_unit
+    for col in seed_columns:
+        if col in work.columns:
+            return infer_amount_unit(work[col], context=context)
+    return "wan"
+
+
+def validate_flow_rank(df):
+    issues = []
+    if df is None or df.empty:
+        return False, ["empty frame"]
+    if "net_inflow" not in df.columns:
+        issues.append("missing column: net_inflow")
+    if "name" not in df.columns and "code" not in df.columns:
+        issues.append("missing name/code")
+    if "net_inflow" in df.columns and df["net_inflow"].notna().sum() == 0:
+        issues.append("net_inflow all null")
+    return len(issues) == 0, issues
+
+
+def validate_stock_flow(df):
+    issues = []
+    if df is None or df.empty:
+        return False, ["empty frame"]
+    if "date" not in df.columns:
+        issues.append("missing column: date")
+    money = [c for c in ("net_inflow", "main_net_inflow") if c in df.columns]
+    if not money:
+        issues.append("missing inflow column")
+    elif all(df[c].notna().sum() == 0 for c in money):
+        issues.append("inflow all null")
+    if "date" in df.columns:
+        if df["date"].isna().any():
+            issues.append("null dates")
+        if len(df) != df["date"].nunique():
+            issues.append("duplicate dates remain")
+        if not df["date"].is_monotonic_increasing:
+            issues.append("dates not sorted")
+    return len(issues) == 0, issues
+
+
+def validate_cross_border(df):
+    issues = []
+    if df is None or df.empty:
+        return False, ["empty frame"]
+    if "date" not in df.columns:
+        issues.append("missing column: date")
+    if "net_inflow" not in df.columns and "north_inflow" not in df.columns:
+        issues.append("missing inflow column")
+    if "date" in df.columns:
+        if df["date"].isna().any():
+            issues.append("null dates")
+        if len(df) != df["date"].nunique():
+            issues.append("duplicate dates remain")
+        if not df["date"].is_monotonic_increasing:
+            issues.append("dates not sorted")
+    return len(issues) == 0, issues
+
+
+def validate_market_flow(df):
+    issues = []
+    if df is None or df.empty:
+        return False, ["empty frame"]
+    if "date" not in df.columns:
+        issues.append("missing column: date")
+    if "main_net_inflow" not in df.columns and "net_inflow" not in df.columns:
+        issues.append("missing inflow column")
+    if "date" in df.columns:
+        if df["date"].isna().any():
+            issues.append("null dates")
+        if len(df) != df["date"].nunique():
+            issues.append("duplicate dates remain")
+        if not df["date"].is_monotonic_increasing:
+            issues.append("dates not sorted")
+    return len(issues) == 0, issues
+
+
+def _finalize_flow(work, source, empty_factory, validator, error=None, **meta):
+    ok, issues = validator(work)
+    issues = list(issues)
+    work.attrs["ok"] = ok
+    work.attrs["issues"] = issues
+    if error:
+        work.attrs["error"] = error
+    if not ok and work.empty:
+        return empty_factory(source, error=error, issues=issues)
+    return work
+
+
+def prepare_flow_rank(
+    df,
+    source=None,
+    period="今日",
+    flow_type="sector",
+    amount_unit="yuan",
+    error=None,
+):
+    """行业 / 个股资金流排名 → 标准列，金额为万元。"""
+    period = normalize_flow_indicator(period)
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return empty_flow(source, error=error, issues=["empty frame"])
+    if not isinstance(df, pd.DataFrame):
+        return empty_flow(source, error=error, issues=["empty frame"])
+
+    work = canonicalize_flow_columns(df.copy())
+    work = rename_columns(work)
+    work = apply_explicit_column_map(work)
+    work = derive_bucket_nets(work)
+    work = coerce_numerics(work)
+    work = _fill_flow_aliases(work)
+
+    money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
+    unit = _resolve_amount_unit(work, amount_unit, flow_type, money_cols)
+    work = scale_to_wan(work, money_cols, unit)
+
+    if "code" in work.columns:
+        work["code"] = work["code"].map(normalize_stock_code)
+        work = work[work["code"].astype(str).str.len().isin((0, 6)) | work["code"].isna()].copy()
+    work["flow_type"] = flow_type
+    work["period"] = period
+    if source:
+        work["source"] = source
+
+    keep = [c for c in FLOW_COLUMNS if c in work.columns]
+    if not keep:
+        return empty_flow(source, error=error, issues=["no usable flow columns"])
+    work = stamp_flow(work[keep], source, unit="万元", flow_type=flow_type, period=period)
+    return _finalize_flow(work, source, empty_flow, validate_flow_rank, error=error)
+
+
+def prepare_stock_flow(
+    df,
+    source=None,
+    code=None,
+    start=None,
+    end=None,
+    amount_unit="yuan",
+    error=None,
+):
+    """个股资金流时间序列 → 标准列，金额为万元。"""
+    if code is not None and not normalize_stock_code(code):
+        return empty_stock_flow(
+            source,
+            error=error or f"invalid stock code: {code!r}",
+            issues=["invalid stock code"],
+        )
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return empty_stock_flow(source, error=error, issues=["empty frame"])
+    if not isinstance(df, pd.DataFrame):
+        return empty_stock_flow(source, error=error, issues=["empty frame"])
+
+    work = df.copy()
+    if work.index.name in ("date", "日期", "trade_date") or isinstance(work.index, pd.DatetimeIndex):
+        work = work.reset_index()
+    work = canonicalize_flow_columns(work)
+    work = rename_columns(work)
+    work = apply_explicit_column_map(work)
+    work = derive_bucket_nets(work)
+    if "date" not in work.columns:
+        return empty_stock_flow(source, error=error, issues=["missing date column"])
+    work["date"] = parse_dates(work["date"])
+    work = coerce_numerics(work)
+    work = _fill_flow_aliases(work)
+
+    money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
+    unit = _resolve_amount_unit(work, amount_unit, "stock", money_cols)
+    work = scale_to_wan(work, money_cols, unit)
+
+    symbol = normalize_stock_code(code) if code else ""
+    if symbol:
+        work["code"] = symbol
+    elif "code" in work.columns:
+        work["code"] = work["code"].map(normalize_stock_code)
+    if source:
+        work["source"] = source
+
+    work = work.dropna(subset=["date"])
+    work = work.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    work = filter_date_range(work, start, end)
+    swapped = bool(work.attrs.get("date_range_swapped"))
+    keep = [c for c in STOCK_FLOW_COLUMNS if c in work.columns]
+    work = stamp_flow(work[keep].reset_index(drop=True), source, unit="万元", flow_type="stock")
+    if swapped:
+        work.attrs["date_range_swapped"] = True
+    out = _finalize_flow(work, source, empty_stock_flow, validate_stock_flow, error=error)
+    if swapped:
+        issues = list(out.attrs.get("issues") or [])
+        if "start/end dates swapped" not in issues:
+            issues.append("start/end dates swapped")
+        out.attrs["issues"] = issues
+        out.attrs["date_range_swapped"] = True
+    return out
+
+
+def prepare_cross_border(
+    df,
+    source=None,
+    direction="northbound",
+    amount_unit="auto",
+    start=None,
+    end=None,
+    error=None,
+):
+    """北向 / 南向时间序列 → 标准列，金额为万元。"""
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return empty_cross_border(source, error=error, issues=["empty frame"], direction=direction)
+    if not isinstance(df, pd.DataFrame):
+        return empty_cross_border(source, error=error, issues=["empty frame"], direction=direction)
+
+    work = df.copy()
+    if work.index.name in ("date", "日期", "trade_date") or isinstance(work.index, pd.DatetimeIndex):
+        work = work.reset_index()
+    work = rename_columns(work)
+    work = apply_explicit_column_map(work)
+    if "date" not in work.columns:
+        return empty_cross_border(
+            source, error=error, issues=["missing date column"], direction=direction
+        )
+    work["date"] = parse_dates(work["date"])
+    work = coerce_numerics(work)
+
+    if "net_inflow" not in work.columns:
+        if direction == "southbound" and "south_inflow" in work.columns:
+            work["net_inflow"] = work["south_inflow"]
+        elif "north_inflow" in work.columns:
+            work["net_inflow"] = work["north_inflow"]
+        elif "south_inflow" in work.columns:
+            work["net_inflow"] = work["south_inflow"]
+    if "north_inflow" not in work.columns and direction != "southbound" and "net_inflow" in work.columns:
+        work["north_inflow"] = work["net_inflow"]
+    if "south_inflow" not in work.columns and direction == "southbound" and "net_inflow" in work.columns:
+        work["south_inflow"] = work["net_inflow"]
+    # 有的沪深港通接口忽略 symbol，南向会原样返回北向；丢掉重复腿，避免图表画两条一样的线。
+    dropped_south = False
+    if {"north_inflow", "south_inflow"}.issubset(work.columns):
+        both = work[["north_inflow", "south_inflow"]].dropna()
+        if len(both) >= 5 and float((both["north_inflow"] == both["south_inflow"]).mean()) >= 0.9:
+            work = work.copy()
+            work["south_inflow"] = pd.NA
+            dropped_south = True
+
+    money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
+    unit = _resolve_amount_unit(work, amount_unit, "cross_border", money_cols or ["net_inflow"])
+    work = scale_to_wan(work, money_cols, unit)
+    work["direction"] = direction
+    if source:
+        work["source"] = source
+
+    work = work.dropna(subset=["date"])
+    work = work.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    work = filter_date_range(work, start, end)
+    swapped = bool(work.attrs.get("date_range_swapped"))
+    keep = [c for c in CROSS_BORDER_COLUMNS if c in work.columns]
+    work = stamp_flow(
+        work[keep].reset_index(drop=True),
+        source,
+        unit="万元",
+        flow_type="cross_border",
+        direction=direction,
+    )
+    if swapped:
+        work.attrs["date_range_swapped"] = True
+    out = _finalize_flow(
+        work,
+        source,
+        lambda src, error=None, issues=None: empty_cross_border(
+            src, error=error, issues=issues, direction=direction
+        ),
+        validate_cross_border,
+        error=error,
+    )
+    if dropped_south:
+        issues = list(out.attrs.get("issues") or [])
+        if "southbound matched northbound; dropped duplicate leg" not in issues:
+            issues.append("southbound matched northbound; dropped duplicate leg")
+        out.attrs["issues"] = issues
+        out.attrs["southbound_dropped"] = True
+    if swapped:
+        issues = list(out.attrs.get("issues") or [])
+        if "start/end dates swapped" not in issues:
+            issues.append("start/end dates swapped")
+        out.attrs["issues"] = issues
+        out.attrs["date_range_swapped"] = True
+    return out
+
+
+def prepare_market_flow(
+    df,
+    source=None,
+    amount_unit="yuan",
+    start=None,
+    end=None,
+    error=None,
+):
+    """市场主力资金时间序列 → 标准列，金额为万元。"""
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return empty_market_flow(source, error=error, issues=["empty frame"])
+    if not isinstance(df, pd.DataFrame):
+        return empty_market_flow(source, error=error, issues=["empty frame"])
+
+    work = df.copy()
+    if work.index.name in ("date", "日期", "trade_date") or isinstance(work.index, pd.DatetimeIndex):
+        work = work.reset_index()
+    work = canonicalize_flow_columns(work)
+    work = rename_columns(work)
+    work = apply_explicit_column_map(work)
+    work = derive_bucket_nets(work)
+    if "date" not in work.columns:
+        return empty_market_flow(source, error=error, issues=["missing date column"])
+    work["date"] = parse_dates(work["date"])
+    work = coerce_numerics(work)
+    work = _fill_flow_aliases(work)
+    if "main_net_inflow" not in work.columns and "net_inflow" in work.columns:
+        work["main_net_inflow"] = work["net_inflow"]
+
+    money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
+    unit = _resolve_amount_unit(work, amount_unit, "market", money_cols)
+    work = scale_to_wan(work, money_cols, unit)
+    if source:
+        work["source"] = source
+
+    work = work.dropna(subset=["date"])
+    work = work.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    work = filter_date_range(work, start, end)
+    swapped = bool(work.attrs.get("date_range_swapped"))
+    keep = [c for c in MARKET_FLOW_COLUMNS if c in work.columns]
+    work = stamp_flow(work[keep].reset_index(drop=True), source, unit="万元", flow_type="market")
+    if swapped:
+        work.attrs["date_range_swapped"] = True
+    out = _finalize_flow(work, source, empty_market_flow, validate_market_flow, error=error)
+    if swapped:
+        issues = list(out.attrs.get("issues") or [])
+        if "start/end dates swapped" not in issues:
+            issues.append("start/end dates swapped")
+        out.attrs["issues"] = issues
+        out.attrs["date_range_swapped"] = True
+    return out

@@ -37,6 +37,10 @@ with st.sidebar:
 
     exclude_halted = st.checkbox("排除停牌", value=True)
 
+    st.subheader("💰 资金流向")
+    use_fund_flow = st.checkbox("叠加主力资金排名", value=False, help="多一次排名接口；限流时会跳过并提示。")
+    min_net_inflow = st.number_input("最小主力净流入（万元）", value=0.0, step=1000.0)
+
     # 筛选按钮
     screen_btn = st.button("🚀 开始筛选", type="primary", use_container_width=True)
 
@@ -76,6 +80,20 @@ if screen_btn:
             if exclude_halted and "status" in filtered.columns:
                 filtered = filtered[filtered["status"] != "halted"]
                 applied.append("非停牌")
+            if use_fund_flow:
+                rank = ak_data.get_stock_fund_flow_rank()
+                if rank is not None and not rank.empty and "code" in rank.columns:
+                    keep = [c for c in ["code", "net_inflow", "main_net_inflow"] if c in rank.columns]
+                    extra = rank[keep].drop_duplicates("code")
+                    filtered = filtered.merge(extra, on="code", how="left")
+                    if min_net_inflow and "net_inflow" in filtered.columns:
+                        filtered = filtered[filtered["net_inflow"].fillna(0) >= min_net_inflow]
+                    applied.append("主力资金")
+                else:
+                    st.caption("主力资金排名暂不可用，已跳过该条件。")
+                    reason = describe_data_problems(rank)
+                    if reason:
+                        st.caption(reason)
 
             st.success(f"✓ 获取到 {len(df)} 只股票，筛选后 {len(filtered)} 只")
             if applied:
@@ -99,6 +117,8 @@ if screen_btn:
                     "board",
                     "exchange",
                     "status",
+                    "net_inflow",
+                    "main_net_inflow",
                 ]
                 if c in filtered.columns
             ]
@@ -147,6 +167,7 @@ else:
         - **市值**: 按总市值（万元）筛选
         - **涨跌幅**: 按当日涨幅筛选
         - **成交量**: 按成交量（手）筛选
+        - **主力资金**: 可选叠加个股净流入排名（万元）
         """)
 
     with col2:

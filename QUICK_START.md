@@ -99,13 +99,20 @@ export TUSHARE_TOKEN=your_token_here
 3. 查看收益分析
 4. 导出报告
 
+### 4. 看资金流向
+1. 打开「市场分析」→「资金流向」
+2. 切换 今日 / 3日 / 5日 / 10日 与行业/概念/地域
+3. 查看流入/流出榜、主力 vs 小单、北向趋势（金额单位：万元）
+4. 「股票分析」里同一只股票会显示主力资金序列和价量背离
+5. 「股票筛选」可勾选「叠加主力资金排名」
+
 ## 测试数据源
 
 运行测试脚本检查数据源是否正常：
 
 ```bash
-# 离线：schema / 缓存 / 配置
-python -m unittest tests.test_data_quality
+# 离线：schema / 缓存 / 配置 / 资金流分析
+python -m unittest tests.test_data_quality tests.test_fund_flow
 
 # 在线冒烟：AKShare 必测，TuShare 无 token 则跳过
 python examples/test_data_source.py

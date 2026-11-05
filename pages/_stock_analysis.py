@@ -183,6 +183,56 @@ if analyze_btn or 'show_analysis' in st.session_state:
                 if st.button("📥 导出Excel"):
                     # 这里可以添加Excel导出功能
                     st.info("Excel导出功能开发中")
+
+            st.subheader("💰 资金流向")
+            try:
+                from src.analysis.fund_flow import (
+                    format_wan,
+                    latest_stock_snapshot,
+                    main_vs_retail,
+                    price_flow_divergence,
+                    unit_caption,
+                )
+
+                with st.spinner("正在获取个股资金流..."):
+                    stock_flow = data_obj.get_stock_fund_flow(
+                        stock_code,
+                        start_date.strftime("%Y%m%d"),
+                        end_date.strftime("%Y%m%d"),
+                    )
+                if stock_flow is not None and not stock_flow.empty:
+                    snap = latest_stock_snapshot(stock_flow)
+                    vs = main_vs_retail(stock_flow)
+                    f1, f2, f3, f4 = st.columns(4)
+                    f1.metric("最新主力净流入", format_wan(snap.get("latest_main")))
+                    f2.metric("近5日主力", format_wan(snap.get("sum_5d")))
+                    f3.metric("近10日主力", format_wan(snap.get("sum_10d")))
+                    f4.metric("小单(散户)", format_wan(vs.get("retail_net_inflow")))
+                    if vs.get("note"):
+                        st.caption(vs["note"])
+                    y_cols = [
+                        c
+                        for c in ["main_net_inflow", "super_large_net", "large_net", "small_net"]
+                        if c in stock_flow.columns
+                    ]
+                    if y_cols:
+                        fig_flow = chart_generator.line_chart(
+                            stock_flow, "date", y_cols, title=f"{stock_code} 主力资金"
+                        )
+                        st.plotly_chart(fig_flow, use_container_width=True)
+                    diverged = price_flow_divergence(hist_data, stock_flow)
+                    if diverged is not None and not diverged.empty and diverged["divergence"].any():
+                        st.markdown("**价量背离（近窗口）**")
+                        hits = diverged[diverged["divergence"]].tail(8)
+                        st.dataframe(hits, use_container_width=True, hide_index=True)
+                    st.caption(unit_caption(stock_flow))
+                else:
+                    st.info("该股票暂无主力资金序列（接口限流、停牌或源不支持时会降级）。")
+                    msg = describe_data_problems(stock_flow)
+                    if msg:
+                        st.caption(msg)
+            except Exception as flow_exc:
+                st.info(f"资金流向暂不可用: {flow_exc}")
             
         else:
             st.error(f"❌ 未能获取股票 {stock_code} 的数据")

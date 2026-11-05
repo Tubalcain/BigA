@@ -1,12 +1,12 @@
 """
-数据层：A股行情 / 列表 / 市场概况采集。
+数据层：A股行情 / 列表 / 市场概况 / 资金流向采集。
 
 页面与示例直接使用：
 - AKShareData / AKShareIndicator
 - TuShareData
 
 两套适配器输出同一套标准化列名；任一源失败时按配置回退到另一源。
-OpenBB 未接入，仅作为可选的未来扩展。
+资金流金额统一为万元。OpenBB 未接入，仅作为可选的未来扩展。
 """
 
 from .akshare_data import AKShareData, AKShareIndicator

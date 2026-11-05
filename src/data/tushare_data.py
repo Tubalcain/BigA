@@ -18,21 +18,31 @@ from .fetch import DataFetchError, safe_fetch
 from .quality import (
     attach_date_swap,
     compact_date,
+    empty_cross_border,
     empty_flow,
     empty_index,
     empty_list,
+    empty_market_flow,
     empty_ohlcv,
     empty_overview,
     empty_quotes,
+    empty_stock_flow,
     infer_limit_pct,
     match_exchange,
     normalize_adjust,
+    normalize_flow_indicator,
     normalize_period,
     normalize_quotes,
+    normalize_sector_type,
     normalize_stock_code,
     normalize_stock_list,
     ordered_date_range,
+    prepare_cross_border,
+    prepare_flow_rank,
+    prepare_market_flow,
     prepare_ohlcv,
+    prepare_stock_flow,
+    sector_type_short,
     stamp_frame,
     to_numeric,
     to_ts_code,
@@ -563,36 +573,300 @@ class TuShareData:
         return self._cached(("industry_boards",), self.ttl_list, loader, stamp_frame(pd.DataFrame(), "tushare"))
 
     def get_fund_flow(self, indicator="今日", allow_fallback=True):
+        """兼容旧接口：行业资金流向排名。不再把沪深股通当日当成板块流。"""
+        return self.get_sector_fund_flow(indicator=indicator, allow_fallback=allow_fallback)
+
+    def get_sector_fund_flow(self, indicator="今日", sector_type="行业资金流", allow_fallback=True):
+        """行业 / 概念 / 地域资金流。优先东财行业接口（需积分），失败回退 AKShare。"""
+        period = normalize_flow_indicator(indicator)
+        sector = normalize_sector_type(sector_type)
         if not self.is_available():
             if allow_fallback:
-                alt = self._try_peer("get_fund_flow", indicator, allow_fallback=False)
+                alt = self._try_peer("get_sector_fund_flow", period, sector, allow_fallback=False)
                 if alt is not None and not alt.empty:
                     return alt
             return empty_flow("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
+            api = getattr(self._pro, "moneyflow_ind_dc", None)
             trade_date = self._latest_open_date()
-            api = getattr(self._pro, "moneyflow_hsgt", None)
             if api is None or not trade_date:
-                return empty_flow("tushare")
-            raw = self._fetch(lambda: api(start_date=trade_date, end_date=trade_date), default=None, label="moneyflow_hsgt")
+                return empty_flow("tushare", issues=["tushare moneyflow_ind_dc unavailable"])
+            content = sector_type_short(sector)
+            raw = self._fetch(
+                lambda: api(trade_date=trade_date, content_type=content),
+                default=None,
+                label=f"moneyflow_ind_dc:{content}@{trade_date}",
+            )
             if raw is None or raw.empty:
-                return empty_flow("tushare")
-            work = raw.copy()
-            work["source"] = "tushare"
-            return stamp_frame(work, "tushare")
+                return empty_flow("tushare", issues=["tushare sector fund flow unavailable"])
+            return prepare_flow_rank(
+                raw, source="tushare", period=period, flow_type="sector", amount_unit="yuan"
+            )
 
-        result = self._cached(("fund_flow", indicator), self.ttl_realtime, loader, empty_flow("tushare"))
+        result = self._cached(
+            ("sector_fund_flow", period, sector),
+            self.ttl_realtime,
+            loader,
+            empty_flow("tushare"),
+        )
         if (result is None or result.empty) and allow_fallback:
-            alt = self._try_peer("get_fund_flow", indicator, allow_fallback=False)
+            alt = self._try_peer("get_sector_fund_flow", period, sector, allow_fallback=False)
             if alt is not None and not alt.empty:
                 return alt
         if result is None or result.empty:
-            return empty_flow("tushare", issues=["fund flow unavailable"])
+            return empty_flow("tushare", issues=["sector fund flow unavailable"])
         return result
 
-    def get_northbound_flow(self):
-        return self.get_fund_flow()
+    def get_stock_fund_flow_rank(self, indicator="今日", allow_fallback=True):
+        """最近交易日全市场 moneyflow 排名。多日周期回退 AKShare。"""
+        period = normalize_flow_indicator(indicator)
+        if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer("get_stock_fund_flow_rank", period, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
+            return empty_flow("tushare", error="tushare unavailable", issues=["tushare unavailable"])
+
+        def loader():
+            if period != "今日":
+                return empty_flow("tushare", issues=["tushare stock rank is daily only"])
+            trade_date = self._latest_open_date()
+            api = getattr(self._pro, "moneyflow", None)
+            if api is None or not trade_date:
+                return empty_flow("tushare", issues=["tushare moneyflow unavailable"])
+            raw = self._fetch(
+                lambda: api(trade_date=trade_date),
+                default=None,
+                label=f"moneyflow@{trade_date}",
+            )
+            if raw is None or raw.empty:
+                return empty_flow("tushare", issues=["tushare stock fund flow rank unavailable"])
+            work = raw.copy()
+            if "ts_code" in work.columns:
+                work["code"] = work["ts_code"].map(normalize_stock_code)
+            names = self._code_name_map()
+            if names and "code" in work.columns:
+                work["name"] = work["code"].map(lambda c: names.get(c, c))
+            return prepare_flow_rank(
+                work, source="tushare", period=period, flow_type="stock", amount_unit="wan"
+            )
+
+        result = self._cached(
+            ("stock_fund_flow_rank", period),
+            self.ttl_realtime,
+            loader,
+            empty_flow("tushare"),
+        )
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer("get_stock_fund_flow_rank", period, allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return alt
+        if result is None or result.empty:
+            return empty_flow("tushare", issues=["stock fund flow rank unavailable"])
+        return result
+
+    def get_stock_fund_flow(self, stock_code, start_date=None, end_date=None, allow_fallback=True):
+        """个股 moneyflow 日序列。金额单位：万元。"""
+        code = normalize_stock_code(stock_code)
+        start, end, swapped = ordered_date_range(start_date, end_date)
+        if not code:
+            return empty_stock_flow(
+                "tushare",
+                error=f"invalid stock code: {stock_code!r}",
+                issues=["invalid stock code"],
+            )
+        if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer(
+                    "get_stock_fund_flow",
+                    code,
+                    start or None,
+                    end or None,
+                    allow_fallback=False,
+                )
+                if alt is not None and not alt.empty:
+                    return attach_date_swap(alt, swapped)
+            return empty_stock_flow("tushare", error="tushare unavailable", issues=["tushare unavailable"])
+
+        def loader():
+            api = getattr(self._pro, "moneyflow", None)
+            if api is None:
+                return empty_stock_flow("tushare", issues=["tushare moneyflow unavailable"])
+            ts_code = to_ts_code(code)
+            raw = self._fetch(
+                lambda: api(ts_code=ts_code, start_date=start or "", end_date=end or ""),
+                default=None,
+                label=f"moneyflow:{ts_code}",
+            )
+            if raw is None or raw.empty:
+                return empty_stock_flow("tushare", issues=["stock fund flow unavailable"])
+            work = raw.copy()
+            if "ts_code" in work.columns:
+                work["code"] = work["ts_code"].map(normalize_stock_code)
+            return prepare_stock_flow(
+                work,
+                source="tushare",
+                code=code,
+                start=start_date,
+                end=end_date,
+                amount_unit="wan",
+            )
+
+        result = self._cached(
+            ("stock_fund_flow", code, start, end),
+            self.cache_ttl,
+            loader,
+            empty_stock_flow("tushare"),
+        )
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer(
+                "get_stock_fund_flow",
+                code,
+                start or None,
+                end or None,
+                allow_fallback=False,
+            )
+            if alt is not None and not alt.empty:
+                return attach_date_swap(alt, swapped)
+        if result is None or result.empty:
+            return attach_date_swap(
+                empty_stock_flow("tushare", issues=["stock fund flow unavailable"]),
+                swapped,
+            )
+        return attach_date_swap(result, swapped)
+
+    def get_market_fund_flow(self, start_date=None, end_date=None, allow_fallback=True):
+        """东财大盘资金流向（需积分）。失败回退 AKShare。"""
+        start, end, swapped = ordered_date_range(start_date, end_date)
+        if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer(
+                    "get_market_fund_flow", start or None, end or None, allow_fallback=False
+                )
+                if alt is not None and not alt.empty:
+                    return attach_date_swap(alt, swapped)
+            return empty_market_flow("tushare", error="tushare unavailable", issues=["tushare unavailable"])
+
+        def loader():
+            api = getattr(self._pro, "moneyflow_mkt_dc", None)
+            if api is None:
+                return empty_market_flow("tushare", issues=["tushare moneyflow_mkt_dc unavailable"])
+            raw = self._fetch(
+                lambda: api(start_date=start or "", end_date=end or ""),
+                default=None,
+                label="moneyflow_mkt_dc",
+            )
+            if raw is None or raw.empty:
+                return empty_market_flow("tushare", issues=["market fund flow unavailable"])
+            return prepare_market_flow(
+                raw, source="tushare", amount_unit="yuan", start=start_date, end=end_date
+            )
+
+        result = self._cached(
+            ("market_fund_flow", start, end),
+            self.cache_ttl,
+            loader,
+            empty_market_flow("tushare"),
+        )
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer(
+                "get_market_fund_flow", start or None, end or None, allow_fallback=False
+            )
+            if alt is not None and not alt.empty:
+                return attach_date_swap(alt, swapped)
+        if result is None or result.empty:
+            return attach_date_swap(
+                empty_market_flow("tushare", issues=["market fund flow unavailable"]),
+                swapped,
+            )
+        return attach_date_swap(result, swapped)
+
+    def get_cross_border_flow(self, start_date=None, end_date=None, allow_fallback=True):
+        """沪深股通 moneyflow_hsgt。金额：接口为百万，输出万元。"""
+        start, end, swapped = ordered_date_range(start_date, end_date)
+        if not start:
+            start = (pd.Timestamp.now() - pd.Timedelta(days=180)).strftime("%Y%m%d")
+        if not end:
+            end = pd.Timestamp.now().strftime("%Y%m%d")
+        if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer(
+                    "get_cross_border_flow", start, end, allow_fallback=False
+                )
+                if alt is not None and not alt.empty:
+                    return attach_date_swap(alt, swapped)
+            return empty_cross_border("tushare", error="tushare unavailable", issues=["tushare unavailable"])
+
+        def loader():
+            api = getattr(self._pro, "moneyflow_hsgt", None)
+            if api is None:
+                return empty_cross_border("tushare", issues=["tushare moneyflow_hsgt unavailable"])
+            raw = self._fetch(
+                lambda: api(start_date=start, end_date=end),
+                default=None,
+                label="moneyflow_hsgt",
+            )
+            if raw is None or raw.empty:
+                return empty_cross_border("tushare", issues=["cross-border flow unavailable"])
+            return prepare_cross_border(
+                raw,
+                source="tushare",
+                direction="northbound",
+                amount_unit="baiwan",
+                start=start_date,
+                end=end_date,
+            )
+
+        result = self._cached(
+            ("cross_border_flow", start, end),
+            self.cache_ttl,
+            loader,
+            empty_cross_border("tushare"),
+        )
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer("get_cross_border_flow", start, end, allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return attach_date_swap(alt, swapped)
+        if result is None or result.empty:
+            return attach_date_swap(
+                empty_cross_border("tushare", issues=["cross-border flow unavailable"]),
+                swapped,
+            )
+        return attach_date_swap(result, swapped)
+
+    def get_northbound_flow(self, start_date=None, end_date=None, allow_fallback=True):
+        frame = self.get_cross_border_flow(start_date, end_date, allow_fallback=allow_fallback)
+        if frame is None or frame.empty:
+            return frame if frame is not None else empty_cross_border("tushare", direction="northbound")
+        work = frame.copy()
+        work.attrs.update(frame.attrs)
+        if "north_inflow" in work.columns:
+            work["net_inflow"] = work["north_inflow"]
+        work["direction"] = "northbound"
+        work.attrs["direction"] = "northbound"
+        return work
+
+    def get_southbound_flow(self, start_date=None, end_date=None, allow_fallback=True):
+        frame = self.get_cross_border_flow(start_date, end_date, allow_fallback=allow_fallback)
+        if frame is None or frame.empty or "south_inflow" not in getattr(frame, "columns", []):
+            return empty_cross_border(
+                "tushare",
+                issues=["southbound unavailable"],
+                direction="southbound",
+            )
+        work = frame.copy()
+        work.attrs.update(frame.attrs)
+        work["net_inflow"] = work["south_inflow"]
+        work["direction"] = "southbound"
+        work.attrs["direction"] = "southbound"
+        return work
+
+    def _code_name_map(self):
+        listed = self.get_stock_list("所有", allow_fallback=False)
+        if listed is None or listed.empty or "code" not in listed.columns or "name" not in listed.columns:
+            return {}
+        return dict(zip(listed["code"], listed["name"]))
 
     def get_trade_calendar(self, start_date=None, end_date=None):
         start = compact_date(start_date) or (pd.Timestamp.now() - pd.Timedelta(days=365)).strftime("%Y%m%d")

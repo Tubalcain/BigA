@@ -201,6 +201,40 @@ class PlotlyChartGenerator(ChartGenerator):
         )
         
         return fig
+
+    def signed_bar_chart(self, df, x_col, y_col, title='资金流向', orientation='h'):
+        """按正负着色的柱状图（A 股习惯：流入红、流出绿）。"""
+        if df is None or df.empty or x_col not in df.columns or y_col not in df.columns:
+            fig = go.Figure()
+            fig.update_layout(title=title, height=400, template='plotly_white')
+            return fig
+        work = df.dropna(subset=[y_col]).copy()
+        work = work.sort_values(y_col, ascending=True)
+        colors = [self.color_up if float(v) >= 0 else self.color_down for v in work[y_col]]
+        fig = go.Figure()
+        if orientation == 'h':
+            fig.add_trace(go.Bar(
+                x=work[y_col],
+                y=work[x_col].astype(str),
+                orientation='h',
+                marker_color=colors,
+                name=y_col,
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=work[x_col].astype(str),
+                y=work[y_col],
+                marker_color=colors,
+                name=y_col,
+            ))
+        fig.update_layout(
+            title=title,
+            height=max(420, 22 * len(work) + 120) if orientation == 'h' else 500,
+            template='plotly_white',
+            xaxis_title=y_col if orientation == 'h' else x_col,
+            yaxis_title=x_col if orientation == 'h' else y_col,
+        )
+        return fig
     
     def pie_chart(self, labels, values, title='饼图'):
         """

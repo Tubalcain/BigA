@@ -389,6 +389,10 @@ class CacheConfigTests(unittest.TestCase):
             flow = client.get_fund_flow(allow_fallback=False)
             self.assertTrue(flow.empty)
             self.assertIn("akshare unavailable", flow.attrs.get("issues", []))
+            self.assertIn("net_inflow", flow.columns)
+            north = client.get_northbound_flow(allow_fallback=False)
+            self.assertTrue(north.empty)
+            self.assertIn("akshare unavailable", north.attrs.get("issues", []))
         finally:
             cfg.akshare.enabled = previous
 

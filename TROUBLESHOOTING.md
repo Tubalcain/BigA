@@ -192,6 +192,21 @@ python examples/test_data_source.py
 ### 问题13：周末或停牌看不到实时价
 适配器会用最近一根 K 线收盘价兜底；`status=halted` 表示停牌。交易日历见 `get_trade_calendar()`。
 
+### 问题14：资金流向是空表 / 只有部分板块
+东财个股与板块资金接口和全市场快照一样容易限流。适配器会：
+1. 写 `df.attrs['issues']`（页面 caption 能看到）
+2. 在 `fallback: true` 时试另一源
+3. **不会**把沪深股通当日一行当成行业排名
+
+金额统一为 **万元**。TuShare 的行业/大盘资金（`moneyflow_ind_dc` / `moneyflow_mkt_dc`）常需较高积分，没权限时回退 AKShare。北向优先用 `moneyflow_hsgt`（TuShare）或东财沪深港通历史（AKShare）。不要对空表循环刷新。
+
+验证：
+
+```bash
+python -m unittest tests.test_fund_flow
+python examples/test_data_source.py
+```
+
 ## 快速诊断命令
 
 ### 检查Python
