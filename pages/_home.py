@@ -50,9 +50,13 @@ st.markdown("---")
 st.subheader("📊 市场概况")
 
 try:
-    from src.data import describe_data_problems, get_active_client
+    from src.data import describe_data_problems, get_active_client, source_switch_note
 
-    ak_data = get_active_client(st.session_state.get("data_source", "akshare"))
+    preferred = st.session_state.get("data_source", "akshare")
+    ak_data = get_active_client(preferred)
+    note = source_switch_note(preferred, ak_data)
+    if note:
+        st.caption(note)
     # 首页只拉指数，避免每次打开都打全市场快照（易限流、很慢）
     indices = ak_data.get_index_quotes()
     overview = ak_data.get_market_overview(light=True)
@@ -82,8 +86,13 @@ try:
         if not up.empty:
             col4.metric("上涨股票", f"{int(up.iloc[0]):,}")
             shown = True
-        source = overview.attrs.get("source") or "akshare"
+        source = overview.attrs.get("source") or ak_data.name
         st.caption(f"数据来源: {source}")
+    elif shown:
+        source = None
+        if indices is not None and not indices.empty:
+            source = indices.attrs.get("source")
+        st.caption(f"数据来源: {source or ak_data.name}")
     if not shown:
         st.info("市场快照暂不可用，请检查网络后刷新。")
         for frame in (indices, overview):

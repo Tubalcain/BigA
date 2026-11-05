@@ -49,10 +49,14 @@ with st.sidebar:
 if len(st.session_state.portfolio) > 0:
     try:
         from src.analysis.portfolio import PortfolioAnalyzer
-        from src.data import get_active_client
+        from src.data import get_active_client, source_switch_note
         
         analyzer = PortfolioAnalyzer(st.session_state.portfolio)
-        ak_data = get_active_client(st.session_state.get("data_source", "akshare"))
+        preferred = st.session_state.get("data_source", "akshare")
+        ak_data = get_active_client(preferred)
+        note = source_switch_note(preferred, ak_data)
+        if note:
+            st.caption(note)
         
         # 获取当前价格
         current_prices = {}

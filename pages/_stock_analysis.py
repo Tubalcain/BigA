@@ -68,16 +68,16 @@ if analyze_btn or 'show_analysis' in st.session_state:
     
     # 获取股票基本信息
     try:
-        from src.data import describe_data_problems, get_active_client, outlier_count
+        from src.data import describe_data_problems, get_active_client, outlier_count, source_switch_note
         from src.analysis.technical import TechnicalAnalyzer
         from src.visualization.charts import PlotlyChartGenerator
         
         preferred = "akshare" if data_source == "AKShare" else "tushare"
         data_obj = get_active_client(preferred)
-        used = getattr(data_obj, "name", preferred)
-        if used != preferred:
-            st.warning(f"{data_source} 不可用，已切换为 {used}")
-            data_source = "AKShare" if used == "akshare" else "TuShare"
+        note = source_switch_note(preferred, data_obj)
+        if note:
+            st.warning(note)
+            data_source = "AKShare" if getattr(data_obj, "name", "") == "akshare" else "TuShare"
 
         if start_date > end_date:
             st.warning("开始日期晚于结束日期，已按时间顺序交换。")

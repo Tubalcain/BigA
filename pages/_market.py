@@ -12,6 +12,16 @@ st.set_page_config(page_title="市场分析", page_icon="📊", layout="wide")
 st.title("📊 市场分析")
 st.markdown("---")
 
+try:
+    from src.data import get_active_client, source_switch_note
+
+    _preferred = st.session_state.get("data_source", "akshare")
+    _note = source_switch_note(_preferred, get_active_client(_preferred))
+    if _note:
+        st.caption(_note)
+except Exception:
+    pass
+
 # Tab功能
 tab1, tab2, tab3 = st.tabs(["🌍 市场概况", "📈 涨跌统计", "💰 资金流向"])
 

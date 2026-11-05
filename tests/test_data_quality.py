@@ -15,6 +15,7 @@ from src.data.cache import TTLCache, make_cache_key
 from src.data.fetch import DataFetchError, RateLimitError, call_with_timeout, is_rate_limited, with_retry
 from src.data.config import get_data_config, load_app_config
 from src.data.quality import (
+    attach_date_swap,
     clean_ohlcv,
     compact_date,
     describe_data_problems,
@@ -27,6 +28,7 @@ from src.data.quality import (
     normalize_period,
     normalize_quotes,
     normalize_stock_code,
+    ordered_date_range,
     outlier_count,
     prepare_ohlcv,
     to_ts_code,
@@ -55,6 +57,10 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(compact_date("2024-1-2"), "20240102")
         self.assertEqual(compact_date("2024/01/02"), "20240102")
         self.assertEqual(compact_date("20240102"), "20240102")
+        start, end, swapped = ordered_date_range("20240110", "20240101")
+        self.assertEqual((start, end, swapped), ("20240101", "20240110", True))
+        start, end, swapped = ordered_date_range("2024-1-2", "2024/01/05")
+        self.assertEqual((start, end, swapped), ("20240102", "20240105", False))
         self.assertEqual(normalize_period("周线"), "weekly")
         self.assertEqual(normalize_adjust("前复权"), "qfq")
 
@@ -129,6 +135,28 @@ class QualityTests(unittest.TestCase):
         )
         self.assertTrue(empty.empty)
         self.assertIn("no valid stock codes", empty.attrs.get("issues", []))
+
+    def test_missing_date_column_is_reported(self):
+        df = normalize_ohlcv(pd.DataFrame({"open": [1], "close": [1]}), source="test")
+        self.assertTrue(df.empty)
+        self.assertIn("missing date column", df.attrs.get("issues", []))
+
+    def test_attach_date_swap_does_not_mutate_cache(self):
+        raw = pd.DataFrame(
+            {
+                "date": ["20240102"],
+                "open": [10],
+                "high": [11],
+                "low": [9],
+                "close": [10.5],
+                "volume": [1],
+            }
+        )
+        df = prepare_ohlcv(raw, source="test")
+        marked = attach_date_swap(df, True)
+        self.assertTrue(marked.attrs.get("date_range_swapped"))
+        self.assertFalse(df.attrs.get("date_range_swapped"))
+        self.assertIn("start/end dates swapped", marked.attrs.get("issues", []))
 
     def test_short_code_does_not_pad_to_pingan(self):
         df = prepare_ohlcv(pd.DataFrame(), source="test", code="1")
@@ -293,6 +321,12 @@ class CacheConfigTests(unittest.TestCase):
         else:
             self.assertEqual(client.name, "tushare")
 
+        from src.data import source_switch_note
+        from types import SimpleNamespace
+
+        self.assertEqual(source_switch_note("tushare", SimpleNamespace(name="akshare")), "数据源 tushare 不可用，已切换为 akshare")
+        self.assertEqual(source_switch_note("akshare", SimpleNamespace(name="akshare")), "")
+
     def test_get_active_client_falls_back_to_tushare_when_akshare_down(self):
         from src.data import get_active_client
         from src.data.akshare_data import AKShareData
@@ -349,9 +383,12 @@ class CacheConfigTests(unittest.TestCase):
             self.assertIn("invalid stock code", quote.attrs.get("issues", []))
             quote2 = client.get_realtime_quote("000001")
             self.assertIsNotNone(quote2)
-            overview = client.get_market_overview(light=True)
+            overview = client.get_market_overview(light=True, allow_fallback=False)
             self.assertTrue(overview.empty)
             self.assertIn("akshare unavailable", overview.attrs.get("issues", []))
+            flow = client.get_fund_flow(allow_fallback=False)
+            self.assertTrue(flow.empty)
+            self.assertIn("akshare unavailable", flow.attrs.get("issues", []))
         finally:
             cfg.akshare.enabled = previous
 

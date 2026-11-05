@@ -363,7 +363,7 @@ def normalize_ohlcv(df, source=None, code=None, adjust=None):
                 break
     if "date" not in work.columns:
         logger.warning("历史数据缺少日期列: %s", list(work.columns))
-        return empty_ohlcv(source)
+        return empty_ohlcv(source, issues=["missing date column"])
 
     work["date"] = parse_dates(work["date"])
     work = coerce_numerics(work)
@@ -561,6 +561,29 @@ def compact_date(value):
         return pd.Timestamp(ts).strftime("%Y%m%d")
     digits = "".join(ch for ch in text if ch.isdigit())
     return digits[:8] if len(digits) >= 8 else ""
+
+
+def ordered_date_range(start=None, end=None):
+    """返回 (start, end, swapped)，起止均为 YYYYMMDD；颠倒时交换。"""
+    start_key = compact_date(start)
+    end_key = compact_date(end)
+    swapped = bool(start_key and end_key and start_key > end_key)
+    if swapped:
+        start_key, end_key = end_key, start_key
+    return start_key, end_key, swapped
+
+
+def attach_date_swap(df, swapped):
+    """给返回表打上 date_range_swapped，避免改到缓存里的原表。"""
+    if df is None or not swapped:
+        return df
+    work = df.copy()
+    work.attrs["date_range_swapped"] = True
+    issues = list(work.attrs.get("issues") or [])
+    if "start/end dates swapped" not in issues:
+        issues.append("start/end dates swapped")
+    work.attrs["issues"] = issues
+    return work
 
 
 def normalize_period(period):

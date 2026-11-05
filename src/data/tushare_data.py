@@ -16,6 +16,7 @@ from .cache import get_cache, make_cache_key
 from .config import get_data_config
 from .fetch import DataFetchError, safe_fetch
 from .quality import (
+    attach_date_swap,
     compact_date,
     empty_flow,
     empty_index,
@@ -30,6 +31,7 @@ from .quality import (
     normalize_quotes,
     normalize_stock_code,
     normalize_stock_list,
+    ordered_date_range,
     prepare_ohlcv,
     stamp_frame,
     to_numeric,
@@ -159,6 +161,7 @@ class TuShareData:
     ):
         """与 AKShareData.get_history_data 相同的页面接口。"""
         code = normalize_stock_code(stock_code)
+        start, end, swapped = ordered_date_range(start_date, end_date)
         if not code:
             return empty_ohlcv(
                 "tushare",
@@ -167,9 +170,9 @@ class TuShareData:
             )
         if not self.is_available():
             if allow_fallback:
-                fallback = self._fallback_history(code, start_date, end_date, period, adjust)
+                fallback = self._fallback_history(code, start, end, period, adjust)
                 if fallback is not None and validate_ohlcv(fallback)[0]:
-                    return fallback
+                    return attach_date_swap(fallback, swapped)
             return empty_ohlcv(
                 "tushare",
                 error="tushare unavailable",
@@ -178,19 +181,18 @@ class TuShareData:
         df = self.get_daily_data(stock_code, start_date, end_date, period=period, adjust=adjust)
         ok, issues = validate_ohlcv(df)
         if not ok and allow_fallback:
-            fallback = self._fallback_history(code, start_date, end_date, period, adjust)
+            fallback = self._fallback_history(code, start, end, period, adjust)
             if fallback is not None and validate_ohlcv(fallback)[0]:
-                return fallback
+                return attach_date_swap(fallback, swapped)
         if not ok:
             df.attrs["issues"] = issues
-        return df
+        return attach_date_swap(df, swapped)
 
     def get_daily_data(self, stock_code, start_date, end_date, period="daily", adjust=None):
         """TuShare 日/周/月线，标准化为 OHLCV。"""
         code = normalize_stock_code(stock_code)
         ts_code = to_ts_code(code)
-        start = compact_date(start_date)
-        end = compact_date(end_date)
+        start, end, _ = ordered_date_range(start_date, end_date)
         period_key = normalize_period(period)
         adj = normalize_adjust(adjust if adjust is not None else self.config.akshare.adjust)
         if not code:
@@ -214,8 +216,8 @@ class TuShareData:
                 source="tushare",
                 code=code,
                 adjust=adj,
-                start=start,
-                end=end,
+                start=start_date,
+                end=end_date,
                 max_abs_return=self.config.quality_max_abs_return,
                 drop_outliers=self.config.drop_outlier_bars,
             )
@@ -417,7 +419,18 @@ class TuShareData:
             # daily_basic 市值已经是万元
             return normalize_quotes(frame, source="tushare", market_cap_unit="wan")
 
-        return self._cached(("quote", code), self.ttl_realtime, loader, empty_quotes("tushare"))
+        quote = self._cached(("quote", code), self.ttl_realtime, loader, empty_quotes("tushare"))
+        if quote is None or quote.empty:
+            alt = self._try_peer("get_realtime_quote", code)
+            if alt is not None and not alt.empty:
+                return alt
+            issues = list((quote.attrs.get("issues") if quote is not None else None) or ["quote unavailable"])
+            return empty_quotes(
+                "tushare",
+                error=(quote.attrs.get("error") if quote is not None else None) or "quote unavailable",
+                issues=issues,
+            )
+        return quote
 
     def get_market_overview(self, light=False, allow_fallback=True):
         """用最近交易日 daily 全市场涨跌估算。light 与 AKShare 对齐，但不因此返回空表。"""
@@ -549,8 +562,12 @@ class TuShareData:
 
         return self._cached(("industry_boards",), self.ttl_list, loader, stamp_frame(pd.DataFrame(), "tushare"))
 
-    def get_fund_flow(self, indicator="今日"):
+    def get_fund_flow(self, indicator="今日", allow_fallback=True):
         if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer("get_fund_flow", indicator, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
             return empty_flow("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
@@ -565,7 +582,14 @@ class TuShareData:
             work["source"] = "tushare"
             return stamp_frame(work, "tushare")
 
-        return self._cached(("fund_flow", indicator), self.ttl_realtime, loader, empty_flow("tushare"))
+        result = self._cached(("fund_flow", indicator), self.ttl_realtime, loader, empty_flow("tushare"))
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer("get_fund_flow", indicator, allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return alt
+        if result is None or result.empty:
+            return empty_flow("tushare", issues=["fund flow unavailable"])
+        return result
 
     def get_northbound_flow(self):
         return self.get_fund_flow()

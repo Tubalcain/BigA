@@ -24,6 +24,7 @@ __all__ = [
     "load_app_config",
     "describe_data_problems",
     "outlier_count",
+    "source_switch_note",
 ]
 
 
@@ -33,7 +34,7 @@ def get_data_source(name=None):
 
     name 为空时用配置 `data_sources.primary`。
     主源失败时的回退由 get_history_data / get_stock_list 等按 config.fallback 处理。
-    页面若选了 TuShare，应检查 is_available() 后再决定是否改用 akshare。
+    页面请用 get_active_client()：当前源不可用时会换到另一源。
     """
     cfg = get_data_config()
     source = (name or cfg.primary or "akshare").strip().lower()
@@ -55,3 +56,14 @@ def get_active_client(name=None):
     if other.is_available():
         return other
     return client
+
+
+def source_switch_note(preferred, client):
+    """页面空态：所选源不可用并已换到另一源时返回提示，否则空串。"""
+    used = getattr(client, "name", "") or ""
+    want = (preferred or "").strip().lower()
+    if want in ("ts",):
+        want = "tushare"
+    if want and used and used != want:
+        return f"数据源 {want} 不可用，已切换为 {used}"
+    return ""

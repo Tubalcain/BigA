@@ -104,7 +104,7 @@ if analyze_btn or 'analyze' in st.session_state:
         st.session_state.analyze = True
     
     try:
-        from src.data import describe_data_problems, get_active_client, outlier_count
+        from src.data import describe_data_problems, get_active_client, outlier_count, source_switch_note
         from src.analysis.trading_signals import TradingSignalAnalyzer
         from src.analysis.trading_signals_optimized import OptimizedTradingSignalAnalyzer
         from src.analysis.advanced_trading import AdvancedTradingAnalyzer
@@ -113,7 +113,11 @@ if analyze_btn or 'analyze' in st.session_state:
         
         # 获取数据
         with st.spinner("正在获取数据..."):
-            ak_data = get_active_client(st.session_state.get("data_source", "akshare"))
+            preferred = st.session_state.get("data_source", "akshare")
+            ak_data = get_active_client(preferred)
+            note = source_switch_note(preferred, ak_data)
+            if note:
+                st.caption(note)
             
             end_date = datetime.now()
             start_date = end_date - timedelta(days=period)

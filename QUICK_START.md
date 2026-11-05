@@ -114,7 +114,7 @@ python examples/test_data_source.py
 ## 常见问题
 
 ### Q: 获取数据失败？
-A: 检查网络连接，确保可以访问AKShare或TuShare服务器。页面空态会显示 `describe_data_problems`（例如代码不是 6 位、源不可用）。工厂 `get_data_source` 不悄悄换源；页面用 `get_active_client`，当前源不可用会换到另一源。不要把短代码当成 000001。开始日期晚于结束日期时会自动交换；`2024-1-2` 这类日期也能解析。
+A: 检查网络连接，确保可以访问AKShare或TuShare服务器。页面空态会显示 `describe_data_problems`（例如代码不是 6 位、源不可用），源切换会显示 `source_switch_note`。工厂 `get_data_source` 不悄悄换源；页面用 `get_active_client`，当前源不可用会换到另一源。不要把短代码当成 000001。开始日期晚于结束日期时会先交换再请求上游；`2024-1-2` 这类日期也能解析。
 
 ### Q: TuShare token如何获取？
 A: 访问 https://tushare.pro 注册并获取token。

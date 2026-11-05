@@ -17,6 +17,7 @@ from .cache import get_cache, make_cache_key
 from .config import get_data_config
 from .fetch import DataFetchError, safe_fetch
 from .quality import (
+    attach_date_swap,
     compact_date,
     empty_flow,
     empty_index,
@@ -31,6 +32,7 @@ from .quality import (
     normalize_quotes,
     normalize_stock_code,
     normalize_stock_list,
+    ordered_date_range,
     prepare_ohlcv,
     rename_columns,
     stamp_frame,
@@ -170,8 +172,7 @@ class AKShareData:
         code = normalize_stock_code(stock_code)
         period_key = normalize_period(period)
         adj = normalize_adjust(adjust if adjust is not None else self.source_cfg.adjust)
-        start = compact_date(start_date)
-        end = compact_date(end_date)
+        start, end, swapped = ordered_date_range(start_date, end_date)
         if not code:
             return empty_ohlcv(
                 "akshare",
@@ -182,7 +183,7 @@ class AKShareData:
             if allow_fallback:
                 fallback = self._fallback_history(code, start, end, period_key, adj)
                 if fallback is not None and validate_ohlcv(fallback)[0]:
-                    return fallback
+                    return attach_date_swap(fallback, swapped)
             return empty_ohlcv(
                 "akshare",
                 error="akshare unavailable",
@@ -196,22 +197,26 @@ class AKShareData:
             return cached
 
         try:
-            df = self._fetch_history(code, start, end, period_key, adj)
+            df = self._fetch_history(
+                code, start, end, period_key, adj,
+                filter_start=start_date, filter_end=end_date,
+            )
         except Exception as exc:
             logger.warning("AKShare 历史拉取异常 %s: %s", code, exc)
             df = empty_ohlcv("akshare", error=str(exc), issues=["fetch failed"])
         ok, issues = validate_ohlcv(df)
         if ok:
             self.cache.set(cache_key, df, ttl=self.cache_ttl)
-            return df
+            return attach_date_swap(df, swapped)
         if allow_fallback:
             fallback = self._fallback_history(code, start, end, period_key, adj)
             if fallback is not None and validate_ohlcv(fallback)[0]:
-                return fallback
+                return attach_date_swap(fallback, swapped)
         logger.warning("AKShare 历史数据不可用 %s: %s", code, issues)
-        return df if df is not None else empty_ohlcv("akshare", issues=issues)
+        out = df if df is not None else empty_ohlcv("akshare", issues=issues)
+        return attach_date_swap(out, swapped)
 
-    def _fetch_history(self, code, start, end, period, adjust):
+    def _fetch_history(self, code, start, end, period, adjust, filter_start=None, filter_end=None):
         if not code:
             return empty_ohlcv("akshare", issues=["invalid stock code"])
         ak = self._client()
@@ -247,8 +252,8 @@ class AKShareData:
             source="akshare",
             code=code,
             adjust=adjust,
-            start=start,
-            end=end,
+            start=filter_start if filter_start is not None else start,
+            end=filter_end if filter_end is not None else end,
             max_abs_return=self.config.quality_max_abs_return,
             drop_outliers=self.config.drop_outlier_bars,
         )
@@ -537,9 +542,13 @@ class AKShareData:
 
         return self._cached(("industry_boards",), self.ttl_list, loader, stamp_frame(pd.DataFrame(), "akshare"))
 
-    def get_fund_flow(self, indicator="今日"):
+    def get_fund_flow(self, indicator="今日", allow_fallback=True):
         """行业资金流向。列：name, net_inflow, change_pct。"""
         if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer("get_fund_flow", indicator, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
             return self._unavailable(empty_flow)
 
         def loader():
@@ -567,7 +576,7 @@ class AKShareData:
                 if isinstance(raw, pd.DataFrame) and not raw.empty:
                     break
             if raw is None or raw.empty:
-                return empty_flow("akshare")
+                return empty_flow("akshare", issues=["fund flow unavailable"])
             work = rename_columns(raw)
             if "name" not in work.columns:
                 for col in work.columns:
@@ -589,7 +598,14 @@ class AKShareData:
             extras = [c for c in work.columns if c not in keep]
             return stamp_frame(work[keep + extras], "akshare")
 
-        return self._cached(("fund_flow", indicator), self.ttl_realtime, loader, empty_flow("akshare"))
+        result = self._cached(("fund_flow", indicator), self.ttl_realtime, loader, empty_flow("akshare"))
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer("get_fund_flow", indicator, allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return alt
+        if result is None or result.empty:
+            return empty_flow("akshare", issues=["fund flow unavailable"])
+        return result
 
     def get_northbound_flow(self):
         """北向资金净流入（若接口可用）。"""
