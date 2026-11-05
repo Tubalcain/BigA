@@ -119,7 +119,7 @@ ModuleNotFoundError: No module named 'src.data'
 **解决方案**：
 1. 确认仓库包含 `src/data/akshare_data.py` 与 `src/data/tushare_data.py`（从项目根目录运行）
 2. 检查网络，确认能访问东财/新浪或 TuShare
-3. 设置 `TUSHARE_TOKEN` 后可自动回退
+3. 设置 `TUSHARE_TOKEN` 后，AKShare 不可用或指数/概况为空时会一跳回退到 TuShare（反之亦然）
 4. 运行 `python examples/test_data_source.py` 看是哪一层失败
 5. 热门代码：000001, 000002, 600519, 600000
 6. 代码必须是 6 位，`1` / `0001` 不会再被补成 `000001`

@@ -74,9 +74,10 @@ if analyze_btn or 'show_analysis' in st.session_state:
         
         preferred = "akshare" if data_source == "AKShare" else "tushare"
         data_obj = get_active_client(preferred)
-        if preferred == "tushare" and getattr(data_obj, "name", "") != "tushare":
-            st.warning("TuShare 未配置或不可用，已切换为 AKShare")
-            data_source = "AKShare"
+        used = getattr(data_obj, "name", preferred)
+        if used != preferred:
+            st.warning(f"{data_source} 不可用，已切换为 {used}")
+            data_source = "AKShare" if used == "akshare" else "TuShare"
 
         if start_date > end_date:
             st.warning("开始日期晚于结束日期，已按时间顺序交换。")

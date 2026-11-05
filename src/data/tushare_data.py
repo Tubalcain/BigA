@@ -108,28 +108,44 @@ class TuShareData:
             reason = "未配置 TUSHARE_TOKEN" if not self.token else (self._init_error or "TuShare 不可用")
             raise DataFetchError(str(reason))
 
-    def _fallback_history(self, code, start_date, end_date, period, adjust):
+    def _peer(self):
         if not self.config.fallback:
             return None
         try:
             from .akshare_data import AKShareData
 
             other = AKShareData(self.config)
-            if not other.is_available():
-                return None
-            df = other.get_history_data(
-                code,
-                start_date,
-                end_date,
-                period=period,
-                adjust=adjust,
-                allow_fallback=False,
-            )
-            if df is not None and not df.empty:
-                logger.info("TuShare 历史行情失败，已回退到 AKShare: %s", code)
-                return df
+            return other if other.is_available() else None
         except Exception as exc:
-            logger.warning("AKShare 回退失败: %s", exc)
+            logger.warning("AKShare 回退不可用: %s", exc)
+            return None
+
+    def _try_peer(self, method, *args, **kwargs):
+        other = self._peer()
+        if other is None:
+            return None
+        func = getattr(other, method, None)
+        if not callable(func):
+            return None
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("回退 %s 失败: %s", method, exc)
+            return None
+
+    def _fallback_history(self, code, start_date, end_date, period, adjust):
+        df = self._try_peer(
+            "get_history_data",
+            code,
+            start_date,
+            end_date,
+            period=period,
+            adjust=adjust,
+            allow_fallback=False,
+        )
+        if df is not None and not df.empty:
+            logger.info("TuShare 历史行情失败，已回退到 AKShare: %s", code)
+            return df
         return None
 
     def get_history_data(
@@ -142,9 +158,16 @@ class TuShareData:
         allow_fallback=True,
     ):
         """与 AKShareData.get_history_data 相同的页面接口。"""
+        code = normalize_stock_code(stock_code)
+        if not code:
+            return empty_ohlcv(
+                "tushare",
+                error=f"invalid stock code: {stock_code!r}",
+                issues=["invalid stock code"],
+            )
         if not self.is_available():
             if allow_fallback:
-                fallback = self._fallback_history(stock_code, start_date, end_date, period, adjust)
+                fallback = self._fallback_history(code, start_date, end_date, period, adjust)
                 if fallback is not None and validate_ohlcv(fallback)[0]:
                     return fallback
             return empty_ohlcv(
@@ -155,7 +178,7 @@ class TuShareData:
         df = self.get_daily_data(stock_code, start_date, end_date, period=period, adjust=adjust)
         ok, issues = validate_ohlcv(df)
         if not ok and allow_fallback:
-            fallback = self._fallback_history(stock_code, start_date, end_date, period, adjust)
+            fallback = self._fallback_history(code, start_date, end_date, period, adjust)
             if fallback is not None and validate_ohlcv(fallback)[0]:
                 return fallback
         if not ok:
@@ -329,17 +352,12 @@ class TuShareData:
             return listed
 
         df = self._cached(("stock_list",), self.ttl_list, loader, empty_list("tushare"))
-        if (df is None or df.empty) and allow_fallback and self.config.fallback:
-            try:
-                from .akshare_data import AKShareData
-
-                other = AKShareData(self.config)
-                return other.get_stock_list(exchange)
-            except Exception as exc:
-                logger.warning("股票列表回退失败: %s", exc)
-                return empty_list("tushare")
+        if (df is None or df.empty) and allow_fallback:
+            alt = self._try_peer("get_stock_list", exchange, allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return alt
         if df is None or df.empty:
-            return empty_list("tushare")
+            return empty_list("tushare", error="stock list unavailable", issues=["stock list unavailable"])
         if "code" in df.columns:
             df = df[df["code"].map(lambda c: match_exchange(c, exchange))].reset_index(drop=True)
         return df
@@ -354,6 +372,9 @@ class TuShareData:
                 issues=["invalid stock code"],
             )
         if not self.is_available():
+            peer_quote = self._try_peer("get_realtime_quote", stock_code)
+            if peer_quote is not None and not peer_quote.empty:
+                return peer_quote
             return empty_quotes("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
@@ -398,10 +419,14 @@ class TuShareData:
 
         return self._cached(("quote", code), self.ttl_realtime, loader, empty_quotes("tushare"))
 
-    def get_market_overview(self, light=False):
-        """用最近交易日 daily 全市场涨跌估算。light=True 时跳过重查询。"""
-        if light or not self.is_available():
-            return empty_overview("tushare")
+    def get_market_overview(self, light=False, allow_fallback=True):
+        """用最近交易日 daily 全市场涨跌估算。light 与 AKShare 对齐，但不因此返回空表。"""
+        if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer("get_market_overview", light=light, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
+            return empty_overview("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
             trade_date = self._latest_open_date()
@@ -439,10 +464,21 @@ class TuShareData:
             ]
             return stamp_frame(pd.DataFrame(rows, columns=["type", "count"]).assign(source="tushare"), "tushare")
 
-        return self._cached(("overview",), self.ttl_realtime, loader, empty_overview("tushare"))
+        result = self._cached(("overview",), self.ttl_realtime, loader, empty_overview("tushare"))
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer("get_market_overview", light=light, allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return alt
+        if result is None or result.empty:
+            return empty_overview("tushare", issues=["overview unavailable"])
+        return result
 
-    def get_index_quotes(self):
+    def get_index_quotes(self, allow_fallback=True):
         if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer("get_index_quotes", allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
             return empty_index("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
@@ -484,7 +520,14 @@ class TuShareData:
                 return empty_index("tushare")
             return stamp_frame(pd.DataFrame(rows), "tushare")
 
-        return self._cached(("index_quotes",), self.ttl_realtime, loader, empty_index("tushare"))
+        result = self._cached(("index_quotes",), self.ttl_realtime, loader, empty_index("tushare"))
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer("get_index_quotes", allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return alt
+        if result is None or result.empty:
+            return empty_index("tushare", issues=["index quotes unavailable"])
+        return result
 
     def get_industry_boards(self):
         """TuShare 行业分类列表（无实时涨跌时仅返回名称）。"""

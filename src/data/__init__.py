@@ -44,14 +44,14 @@ def get_data_source(name=None):
 
 def get_active_client(name=None):
     """
-    给页面用的客户端：先按 name / primary 取源，不可用则落到 AKShare。
-    与 get_data_source 不同，这里会换源，避免每个页面复制同一段降级逻辑。
+    给页面用的客户端：先按 name / primary 取源，不可用则换到另一源。
+    与 get_data_source 不同，这里会换源（akshare ↔ tushare），避免每个页面复制降级逻辑。
     """
     client = get_data_source(name)
     if client.is_available():
         return client
-    if getattr(client, "name", "") != "akshare":
-        fallback = get_data_source("akshare")
-        if fallback.is_available():
-            return fallback
+    other_name = "tushare" if getattr(client, "name", "") == "akshare" else "akshare"
+    other = get_data_source(other_name)
+    if other.is_available():
+        return other
     return client

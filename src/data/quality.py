@@ -539,13 +539,28 @@ def normalize_stock_list(df, source=None):
 
 
 def compact_date(value):
-    """任意日期 → YYYYMMDD 字符串；空值返回空串。"""
+    """任意日期 → YYYYMMDD 字符串；空值返回空串。
+
+    先认 YYYYMMDD，再用 pandas 解析 ``2024-1-2`` / ``2024/01/02``，
+    避免只抽数字时把 ``2024-1-2`` 收成 ``202412``。
+    """
     if value is None or value == "":
         return ""
     if hasattr(value, "strftime"):
-        return value.strftime("%Y%m%d")
-    digits = "".join(ch for ch in str(value).strip() if ch.isdigit())
-    return digits[:8] if len(digits) >= 8 else digits
+        try:
+            return value.strftime("%Y%m%d")
+        except (ValueError, OverflowError, TypeError):
+            pass
+    text = str(value).strip()
+    if not text or text.lower() in ("nat", "none", "nan"):
+        return ""
+    if len(text) == 8 and text.isdigit():
+        return text
+    ts = pd.to_datetime(text, errors="coerce")
+    if pd.notna(ts):
+        return pd.Timestamp(ts).strftime("%Y%m%d")
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[:8] if len(digits) >= 8 else ""
 
 
 def normalize_period(period):

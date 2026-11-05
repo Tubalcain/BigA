@@ -87,6 +87,31 @@ class AKShareData:
     def _unavailable(self, factory):
         return factory("akshare", error="akshare unavailable", issues=["akshare unavailable"])
 
+    def _peer(self):
+        if not self.config.fallback:
+            return None
+        try:
+            from .tushare_data import TuShareData
+
+            other = TuShareData(self.config)
+            return other if other.is_available() else None
+        except Exception as exc:
+            logger.warning("TuShare 回退不可用: %s", exc)
+            return None
+
+    def _try_peer(self, method, *args, **kwargs):
+        other = self._peer()
+        if other is None:
+            return None
+        func = getattr(other, method, None)
+        if not callable(func):
+            return None
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("回退 %s 失败: %s", method, exc)
+            return None
+
     def _fetch(self, func, default=None, label="", retries=None, timeout=None):
         return safe_fetch(
             func,
@@ -110,27 +135,18 @@ class AKShareData:
         return value
 
     def _fallback_history(self, code, start_date, end_date, period, adjust):
-        if not self.config.fallback:
-            return None
-        try:
-            from .tushare_data import TuShareData
-
-            other = TuShareData(self.config)
-            if not other.is_available():
-                return None
-            df = other.get_history_data(
-                code,
-                start_date,
-                end_date,
-                period=period,
-                adjust=adjust,
-                allow_fallback=False,
-            )
-            if df is not None and not df.empty:
-                logger.info("AKShare 历史行情失败，已回退到 TuShare: %s", code)
-                return df
-        except Exception as exc:
-            logger.warning("TuShare 回退失败: %s", exc)
+        df = self._try_peer(
+            "get_history_data",
+            code,
+            start_date,
+            end_date,
+            period=period,
+            adjust=adjust,
+            allow_fallback=False,
+        )
+        if df is not None and not df.empty:
+            logger.info("AKShare 历史行情失败，已回退到 TuShare: %s", code)
+            return df
         return None
 
     def get_history_data(
@@ -258,7 +274,7 @@ class AKShareData:
                 if isinstance(raw, pd.DataFrame) and not raw.empty:
                     break
             if raw is None or raw.empty:
-                return empty_quotes("akshare")
+                return empty_quotes("akshare", issues=["spot snapshot unavailable"])
             return normalize_quotes(raw, source="akshare", market_cap_unit="yuan")
 
         if not self.is_available():
@@ -272,15 +288,10 @@ class AKShareData:
         股票列表。优先返回带行情字段的快照，便于筛选器按市值/涨跌幅/成交量过滤。
         """
         if not self.is_available():
-            if allow_fallback and self.config.fallback:
-                try:
-                    from .tushare_data import TuShareData
-
-                    other = TuShareData(self.config)
-                    if other.is_available():
-                        return other.get_stock_list(exchange, allow_fallback=False)
-                except Exception as exc:
-                    logger.warning("股票列表回退失败: %s", exc)
+            if allow_fallback:
+                alt = self._try_peer("get_stock_list", exchange, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
             return self._unavailable(empty_list)
 
         def loader():
@@ -299,16 +310,15 @@ class AKShareData:
 
         df = self._cached(("stock_list",), self.ttl_list, loader, empty_list("akshare"))
         if df is None or df.empty:
-            if allow_fallback and self.config.fallback:
-                try:
-                    from .tushare_data import TuShareData
-
-                    other = TuShareData(self.config)
-                    if other.is_available():
-                        return other.get_stock_list(exchange, allow_fallback=False)
-                except Exception as exc:
-                    logger.warning("股票列表回退失败: %s", exc)
-            return empty_list("akshare", error="stock list unavailable")
+            if allow_fallback:
+                alt = self._try_peer("get_stock_list", exchange, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
+            return empty_list(
+                "akshare",
+                error="stock list unavailable",
+                issues=["stock list unavailable"],
+            )
         if "code" in df.columns:
             mask = df["code"].map(lambda c: match_exchange(c, exchange))
             df = df[mask].reset_index(drop=True)
@@ -349,7 +359,9 @@ class AKShareData:
 
         quote = self._cached(("quote", code), self.ttl_realtime, loader, empty_quotes("akshare"))
         if quote is None or quote.empty:
-            hist = self.get_history_data(code, "", "", allow_fallback=True)
+            end = compact_date(pd.Timestamp.now())
+            start = compact_date(pd.Timestamp.now() - pd.Timedelta(days=14))
+            hist = self.get_history_data(code, start, end, allow_fallback=True)
             if hist is not None and not hist.empty:
                 last = hist.iloc[[-1]]
                 fallback = pd.DataFrame(
@@ -375,9 +387,13 @@ class AKShareData:
             )
         return quote
 
-    def get_market_overview(self, light=False):
+    def get_market_overview(self, light=False, allow_fallback=True):
         """涨跌分布，列：type, count。默认先乐咕再快照；light=True 不打全市场。"""
         if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer("get_market_overview", light=light, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
             return self._unavailable(empty_overview)
 
         def from_spot():
@@ -429,12 +445,20 @@ class AKShareData:
         if (overview is None or overview.empty) and not light:
             overview = from_spot()
         if overview is None or overview.empty:
+            if allow_fallback:
+                alt = self._try_peer("get_market_overview", light=light, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
             return empty_overview("akshare", issues=["overview unavailable"])
         return overview
 
-    def get_index_quotes(self):
+    def get_index_quotes(self, allow_fallback=True):
         """主要 A 股指数实时行情。"""
         if not self.is_available():
+            if allow_fallback:
+                alt = self._try_peer("get_index_quotes", allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
             return self._unavailable(empty_index)
 
         def loader():
@@ -448,7 +472,7 @@ class AKShareData:
                 if isinstance(raw, pd.DataFrame) and not raw.empty:
                     break
             if raw is None or raw.empty:
-                return empty_index("akshare")
+                return empty_index("akshare", issues=["index quotes unavailable"])
             work = rename_columns(raw)
             if "price" not in work.columns and "close" in work.columns:
                 work["price"] = work["close"]
@@ -473,7 +497,14 @@ class AKShareData:
                     work = subset
             return stamp_frame(work.reset_index(drop=True), "akshare")
 
-        return self._cached(("index_quotes",), self.ttl_realtime, loader, empty_index("akshare"))
+        result = self._cached(("index_quotes",), self.ttl_realtime, loader, empty_index("akshare"))
+        if (result is None or result.empty) and allow_fallback:
+            alt = self._try_peer("get_index_quotes", allow_fallback=False)
+            if alt is not None and not alt.empty:
+                return alt
+        if result is None or result.empty:
+            return empty_index("akshare", issues=["index quotes unavailable"])
+        return result
 
     def get_industry_boards(self):
         """行业板块行情（东财）。"""

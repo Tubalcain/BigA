@@ -92,6 +92,6 @@ try:
                 st.caption(msg)
                 break
 except Exception as exc:
-    st.info("正在加载市场数据...")
+    st.warning("市场数据加载失败")
     st.caption(str(exc))
 

@@ -65,7 +65,7 @@ with st.sidebar:
     st.session_state.data_source = 'akshare' if data_source == "AKShare (推荐)" else 'tushare'
     
     if st.session_state.data_source == 'tushare':
-        st.info("💡 使用TuShare需要配置Token")
+        st.info("💡 使用 TuShare 需要配置 TUSHARE_TOKEN；未配置时页面会回退到 AKShare")
     
     st.markdown("---")
     

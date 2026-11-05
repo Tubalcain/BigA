@@ -26,10 +26,10 @@
 
 质量约定：
 
-- 适配器工厂是 `get_data_source("akshare"|"tushare")`：**不会**在无 token 时悄悄换源。页面用 `get_active_client()`，不可用时才落到 AKShare。历史/列表方法在 `fallback: true` 时仍会回退。
+- 适配器工厂是 `get_data_source("akshare"|"tushare")`：**不会**在无 token 时悄悄换源。页面用 `get_active_client()`，当前源不可用时会换到另一源（akshare ↔ tushare）。历史 / 列表 / 指数 / 概况在 `fallback: true` 时也会一跳回退。
 - 股票代码必须是 6 位（`000001.SZ` 可以），不会把 `1` 补成平安银行；非法代码和不可用源会返回空表，并在 `df.attrs['issues']` / `error` 写明原因。
 - 中英列名映射到同一套英文 schema；报价丢掉未知列和空/非法代码。
-- 日期为 **Asia/Shanghai 日历日**（naive midnight）；起止日期颠倒会自动交换，并标记 `date_range_swapped`。
+- 日期为 **Asia/Shanghai 日历日**（naive midnight）；`2024-1-2` / `2024/01/02` 会收成 `YYYYMMDD`；起止颠倒会自动交换，并标记 `date_range_swapped`。
 - 去重、丢弃缺 OHLC 的 bar、把 high/low 钳到包含 open/close，标记 `is_outlier`；页面会提示异常 K 线数量。
 - 空态可用 `describe_data_problems(df)` 收成一行给 UI。TTL 缓存只保存校验通过的历史 K 线；超时立刻返回，不等后台线程。
 

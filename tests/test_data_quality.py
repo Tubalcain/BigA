@@ -52,6 +52,9 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(normalize_stock_code("00001"), "")
         self.assertEqual(to_ts_code("1"), "")
         self.assertEqual(compact_date("2024-01-02"), "20240102")
+        self.assertEqual(compact_date("2024-1-2"), "20240102")
+        self.assertEqual(compact_date("2024/01/02"), "20240102")
+        self.assertEqual(compact_date("20240102"), "20240102")
         self.assertEqual(normalize_period("周线"), "weekly")
         self.assertEqual(normalize_adjust("前复权"), "qfq")
 
@@ -290,6 +293,22 @@ class CacheConfigTests(unittest.TestCase):
         else:
             self.assertEqual(client.name, "tushare")
 
+    def test_get_active_client_falls_back_to_tushare_when_akshare_down(self):
+        from src.data import get_active_client
+        from src.data.akshare_data import AKShareData
+        from src.data.tushare_data import TuShareData
+
+        original_ak = AKShareData.is_available
+        original_ts = TuShareData.is_available
+        try:
+            AKShareData.is_available = lambda self: False
+            TuShareData.is_available = lambda self: True
+            client = get_active_client("akshare")
+            self.assertIsInstance(client, TuShareData)
+        finally:
+            AKShareData.is_available = original_ak
+            TuShareData.is_available = original_ts
+
     def test_tushare_unavailable_without_token(self):
         from src.data.tushare_data import TuShareData
 
@@ -306,6 +325,12 @@ class CacheConfigTests(unittest.TestCase):
         quote = client.get_realtime_quote("1")
         self.assertTrue(quote.empty)
         self.assertIn("invalid stock code", quote.attrs.get("issues", []))
+        bad = client.get_history_data("1", "20240101", "20240110", allow_fallback=True)
+        self.assertTrue(bad.empty)
+        self.assertIn("invalid stock code", bad.attrs.get("issues", []))
+        overview = client.get_market_overview(light=True, allow_fallback=False)
+        self.assertTrue(overview.empty)
+        self.assertIn("tushare unavailable", overview.attrs.get("issues", []))
 
     def test_disabled_akshare_returns_empty_not_raise(self):
         from src.data.akshare_data import AKShareData
