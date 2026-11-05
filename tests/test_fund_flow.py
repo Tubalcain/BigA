@@ -11,6 +11,8 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 
 from src.analysis.fund_flow import (
+    actual_period_label,
+    actual_sector_label,
     enrich_sector_flow,
     extreme_rows,
     format_wan,
@@ -20,11 +22,13 @@ from src.analysis.fund_flow import (
     price_flow_divergence,
     rank_inflow,
     rank_outflow,
+    scope_fallback_note,
     stock_flow_notes,
     summarize_rank,
     unit_caption,
 )
 from src.data.quality import (
+    attach_rank_scope,
     canonicalize_flow_columns,
     derive_bucket_nets,
     empty_flow,
@@ -164,6 +168,81 @@ class FlowQualityTests(unittest.TestCase):
         scaled = scale_to_wan(pd.DataFrame({"net_inflow": [10000.0]}), ["net_inflow"], "wan")
         self.assertAlmostEqual(scaled.iloc[0]["net_inflow"], 10000.0)
 
+    def test_attach_rank_scope_records_period_and_sector_fallback(self):
+        raw = pd.DataFrame(
+            {
+                "名称": ["银行", "地产"],
+                "主力净流入-净额": [10000.0, -2000.0],
+            }
+        )
+        df = prepare_flow_rank(raw, source="test", period="今日", amount_unit="wan")
+        scoped = attach_rank_scope(
+            df,
+            requested_period="5日",
+            actual_period="今日",
+            requested_sector="概念资金流",
+            actual_sector="行业资金流",
+        )
+        self.assertEqual(scoped.attrs.get("actual_period"), "今日")
+        self.assertEqual(scoped.attrs.get("requested_period"), "5日")
+        self.assertEqual(scoped.attrs.get("actual_sector"), "行业资金流")
+        self.assertIn("period_fallback:5日→今日", scoped.attrs.get("issues", []))
+        self.assertIn("sector_fallback:概念资金流→行业资金流", scoped.attrs.get("issues", []))
+        self.assertTrue((scoped["period"] == "今日").all())
+        self.assertEqual(actual_period_label(scoped, "5日"), "今日")
+        self.assertEqual(actual_sector_label(scoped, "概念"), "行业")
+        note = scope_fallback_note(scoped, requested_period="5日", requested_sector="概念")
+        self.assertIn("5日→今日", note)
+        caption = unit_caption(scoped, requested_period="5日")
+        self.assertIn("周期: 今日", caption)
+        self.assertIn("请求周期: 5日", caption)
+
+    def test_all_zero_and_bucket_consistency(self):
+        zeros = prepare_flow_rank(
+            pd.DataFrame({"名称": ["A", "B"], "主力净流入-净额": [0.0, 0.0]}),
+            source="test",
+            amount_unit="wan",
+        )
+        self.assertIn("all-zero amounts", zeros.attrs.get("issues", []))
+        self.assertFalse(zeros.attrs.get("ok"))
+
+        inconsistent = pd.DataFrame(
+            {
+                "name": ["a", "b", "c", "d"],
+                "net_inflow": [100.0, 100.0, 100.0, 100.0],
+                "main_net_inflow": [100.0, 100.0, 100.0, 100.0],
+                "super_large_net": [10.0, 10.0, 10.0, 10.0],
+                "large_net": [10.0, 10.0, 10.0, 10.0],
+            }
+        )
+        ok, issues = validate_flow_rank(inconsistent)
+        self.assertTrue(ok)
+        self.assertTrue(any("main_net inconsistent" in i for i in issues))
+
+    def test_spike_flags_on_stock_flow(self):
+        raw = pd.DataFrame(
+            {
+                "日期": pd.date_range("2024-01-01", periods=8, freq="D"),
+                "主力净流入-净额": [100.0, 110.0, 90.0, 105.0, 95.0, 100.0, 80.0, 20000.0],
+            }
+        )
+        df = prepare_stock_flow(raw, source="test", code="000001", amount_unit="wan")
+        self.assertIn("is_spike", df.columns)
+        self.assertTrue(bool(df["is_spike"].iloc[-1]))
+        self.assertTrue(any(str(i).startswith("spike_flags:") for i in df.attrs.get("issues", [])))
+        self.assertTrue(df.attrs.get("ok"))
+
+    def test_explicit_wrong_unit_falls_back_via_sanity(self):
+        raw = pd.DataFrame(
+            {
+                "日期": pd.date_range("2024-01-01", periods=10, freq="D"),
+                "当日成交净买额": [20.0, -15.0, 30.0, 18.0, 22.0, 25.0, 19.0, 21.0, 17.0, 23.0],
+            }
+        )
+        df = prepare_cross_border(raw, source="test", amount_unit="wan")
+        self.assertAlmostEqual(df.iloc[-1]["net_inflow"], 230000.0)
+        self.assertTrue(any("unit_fallback:wan→yi" in i for i in df.attrs.get("issues", [])))
+
     def test_empty_flow_has_schema_and_issues(self):
         empty = empty_flow("akshare", error="akshare unavailable", issues=["akshare unavailable"])
         self.assertTrue(empty.empty)
@@ -200,6 +279,15 @@ class FlowAnalysisTests(unittest.TestCase):
         self.assertEqual(summary["top_inflow"][0]["name"], "半导体")
         extremes = extreme_rows(df, n=1)
         self.assertEqual(set(extremes["name"]), {"半导体", "煤炭"})
+        self.assertEqual(summary["total_net_inflow"], 8000.0)
+        concept = df.copy()
+        concept.attrs["actual_sector"] = "概念资金流"
+        concept_summary = summarize_rank(concept, n=2)
+        self.assertTrue(concept_summary["overlapping"])
+        self.assertIsNone(concept_summary["total_net_inflow"])
+        vs = main_vs_retail(concept)
+        self.assertTrue(vs.get("overlapping"))
+        self.assertIn("不能当作全市场", vs.get("note", ""))
 
     def test_main_vs_retail_and_notes(self):
         df = self._rank()
@@ -238,9 +326,12 @@ class FlowAnalysisTests(unittest.TestCase):
         dates = pd.date_range("2024-01-01", periods=8, freq="D")
         price = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
         flow = pd.DataFrame({"date": dates, "main_net_inflow": [100, 80, -50, -80, -90, -100, -120, -150]})
-        result = price_flow_divergence(price, flow, window=3)
+        result = price_flow_divergence(price, flow, window=3, min_abs_pct=0.02, min_abs_flow=50)
         self.assertTrue(result["divergence"].any())
-        self.assertTrue((result.loc[result["divergence"], "note"].str.contains("派发")).any())
+        self.assertTrue((result.loc[result["divergence"], "note"] == "价涨资出").any())
+        self.assertFalse(result["note"].str.contains("派发|吸筹|价量").any())
+        quiet = price_flow_divergence(price, flow, window=3, min_abs_pct=0.5, min_abs_flow=50)
+        self.assertFalse(quiet["divergence"].any())
 
     def test_enrich_sector_flow(self):
         flow = pd.DataFrame({"name": ["银行", "地产"], "net_inflow": [1.0, -1.0]})
@@ -305,6 +396,50 @@ class FlowAdapterEmptyTests(unittest.TestCase):
         self.assertTrue(stock.empty)
         north = client.get_northbound_flow(allow_fallback=False)
         self.assertTrue(north.empty)
+        multi = client.get_sector_fund_flow(indicator="5日", allow_fallback=False)
+        self.assertTrue(multi.empty)
+        self.assertTrue(any("daily only" in i for i in multi.attrs.get("issues", [])))
+        self.assertNotEqual(multi.attrs.get("actual_period"), "5日")
+        self.assertNotEqual(multi.attrs.get("period"), "5日")
+        rank_multi = client.get_stock_fund_flow_rank(indicator="5日", allow_fallback=False)
+        self.assertTrue(rank_multi.empty)
+        self.assertTrue(any("daily only" in i for i in rank_multi.attrs.get("issues", [])))
+
+    def test_akshare_sector_fallback_stamps_actual_scope(self):
+        from src.data.akshare_data import AKShareData
+        from src.data.config import get_data_config
+
+        cfg = get_data_config(reload=True)
+        client = AKShareData(cfg)
+        client.is_available = lambda: True
+
+        class FakeAK:
+            def stock_sector_fund_flow_rank(self, **kwargs):
+                return pd.DataFrame()
+
+        client._client = lambda: FakeAK()
+
+        def fake_fetch(fn, default=None, label="", retries=1):
+            if label.endswith("今日:行业资金流"):
+                return pd.DataFrame(
+                    {
+                        "名称": ["银行"],
+                        "主力净流入-净额": [1.2e8],
+                    }
+                )
+            return pd.DataFrame()
+
+        client._fetch = fake_fetch
+        df = client.get_sector_fund_flow(
+            indicator="5日", sector_type="概念", allow_fallback=False
+        )
+        self.assertFalse(df.empty)
+        self.assertEqual(df.attrs.get("actual_period"), "今日")
+        self.assertEqual(df.attrs.get("requested_period"), "5日")
+        self.assertEqual(df.attrs.get("actual_sector"), "行业资金流")
+        self.assertIn("period_fallback:5日→今日", df.attrs.get("issues", []))
+        self.assertIn("sector_fallback:概念资金流→行业资金流", df.attrs.get("issues", []))
+        self.assertTrue((df["period"] == "今日").all())
 
 
 if __name__ == "__main__":

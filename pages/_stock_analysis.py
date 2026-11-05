@@ -222,7 +222,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
                         st.plotly_chart(fig_flow, use_container_width=True)
                     diverged = price_flow_divergence(hist_data, stock_flow)
                     if diverged is not None and not diverged.empty and diverged["divergence"].any():
-                        st.markdown("**价量背离（近窗口）**")
+                        st.markdown("**价资背离（近窗口）**")
                         hits = diverged[diverged["divergence"]].tail(8)
                         st.dataframe(hits, use_container_width=True, hide_index=True)
                     st.caption(unit_caption(stock_flow))

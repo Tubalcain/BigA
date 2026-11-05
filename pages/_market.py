@@ -185,6 +185,8 @@ with tab3:
 
     try:
         from src.analysis.fund_flow import (
+            actual_period_label,
+            actual_sector_label,
             enrich_sector_flow,
             extreme_rows,
             format_wan,
@@ -192,7 +194,7 @@ with tab3:
             northbound_regime,
             rank_inflow,
             rank_outflow,
-            summarize_rank,
+            scope_fallback_note,
             unit_caption,
         )
         from src.visualization.charts import PlotlyChartGenerator
@@ -222,28 +224,30 @@ with tab3:
             st.plotly_chart(fig_mkt, use_container_width=True)
             st.caption(unit_caption(market_flow))
         else:
-            summary = summarize_rank(sector)
-            if sector is not None and not sector.empty:
-                s1, s2, s3 = st.columns(3)
-                s1.metric("板块净流入合计", format_wan(summary["total_net_inflow"]))
-                s2.metric("净流入板块", summary["inflow_count"])
-                s3.metric("净流出板块", summary["outflow_count"])
-                st.caption("大盘序列暂不可用，上表由板块排名加总近似（行业之间可能有重叠）。")
-            else:
-                _show_empty(market_flow, "市场级资金序列暂时不可用。")
+            _show_empty(market_flow, "市场级资金序列暂时不可用，不使用板块加总冒充全市场。")
+
+        actual_sector = actual_sector_label(sector, sector_kind)
+        actual_period = actual_period_label(sector, period)
+        fallback_note = scope_fallback_note(sector, requested_period=period, requested_sector=sector_kind)
+        if fallback_note:
+            st.warning(fallback_note)
 
         st.markdown("---")
-        st.markdown(f"#### {sector_kind}资金排名（{period}）")
+        st.markdown(f"#### {actual_sector or sector_kind}资金排名（{actual_period or period}）")
         if sector is not None and not sector.empty and "net_inflow" in sector.columns:
             vs = main_vs_retail(sector)
             c1, c2, c3 = st.columns(3)
-            c1.metric("主力合计", format_wan(vs.get("main_net_inflow")))
-            c2.metric("小单合计", format_wan(vs.get("retail_net_inflow")))
+            if vs.get("overlapping"):
+                c1.metric("榜内主力合计", format_wan(vs.get("main_net_inflow")))
+                c2.metric("榜内小单合计", format_wan(vs.get("retail_net_inflow")))
+            else:
+                c1.metric("主力合计", format_wan(vs.get("main_net_inflow")))
+                c2.metric("小单合计", format_wan(vs.get("retail_net_inflow")))
             c3.caption(vs.get("note") or "")
             chart_df = extreme_rows(sector, n=rank_n)
             label = "name" if "name" in chart_df.columns else "code"
             fig = chart_gen.signed_bar_chart(
-                chart_df, label, "net_inflow", title=f"{sector_kind}净流入 / 净流出"
+                chart_df, label, "net_inflow", title=f"{actual_sector or sector_kind}净流入 / 净流出（{actual_period or period}）"
             )
             st.plotly_chart(fig, use_container_width=True)
             left, right = st.columns(2)
@@ -253,12 +257,16 @@ with tab3:
             with right:
                 st.markdown("**流出榜**")
                 _flow_table(rank_outflow(sector, n=rank_n))
-            st.caption(unit_caption(sector))
+            st.caption(unit_caption(sector, requested_period=period, requested_sector=sector_kind))
         else:
             _show_empty(sector, "板块资金流向暂时不可用。")
 
+        stock_period = actual_period_label(stock_rank, period)
+        stock_fallback = scope_fallback_note(stock_rank, requested_period=period)
+        if stock_fallback:
+            st.caption(stock_fallback)
         st.markdown("---")
-        st.markdown(f"#### 个股主力排名（{period}）")
+        st.markdown(f"#### 个股主力排名（{stock_period or period}）")
         if stock_rank is not None and not stock_rank.empty and "net_inflow" in stock_rank.columns:
             chart_df = extreme_rows(stock_rank, n=rank_n)
             label = "name" if "name" in chart_df.columns else "code"
@@ -273,7 +281,7 @@ with tab3:
             with right:
                 st.markdown("**流出榜**")
                 _flow_table(rank_outflow(stock_rank, n=rank_n))
-            st.caption(unit_caption(stock_rank))
+            st.caption(unit_caption(stock_rank, requested_period=period))
         else:
             _show_empty(stock_rank, "个股资金排名暂时不可用。")
 

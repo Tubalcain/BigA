@@ -198,7 +198,7 @@ python examples/test_data_source.py
 2. 在 `fallback: true` 时试另一源
 3. **不会**把沪深股通当日一行当成行业排名
 
-金额统一为 **万元**。TuShare 的行业/大盘资金（`moneyflow_ind_dc` / `moneyflow_mkt_dc`）常需较高积分，没权限时回退 AKShare。北向优先用 `moneyflow_hsgt`（TuShare）或东财沪深港通历史（AKShare）。不要对空表循环刷新。
+金额统一为 **万元**。TuShare 的行业/大盘资金（`moneyflow_ind_dc` / `moneyflow_mkt_dc`）常需较高积分，没权限时回退 AKShare。TuShare 行业/个股排名只有日频：选 5 日等周期时会空表或回退 AKShare，并把实际周期写进 `actual_period`，不会盖「5日」假章。概念/地域互相重叠，页面不会把板块加总冒充全市场。北向优先用 `moneyflow_hsgt`（TuShare）或东财沪深港通历史（AKShare）。不要对空表循环刷新。
 
 验证：
 

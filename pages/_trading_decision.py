@@ -217,26 +217,34 @@ if analyze_btn or 'analyze' in st.session_state:
 
             try:
                 from src.analysis.fund_flow import format_wan, northbound_regime, stock_flow_notes
+                from src.data import describe_data_problems
 
                 end_key = end_date.strftime("%Y%m%d")
                 start_key = start_date.strftime("%Y%m%d")
                 stock_flow = ak_data.get_stock_fund_flow(stock_code, start_key, end_key)
                 north = ak_data.get_northbound_flow()
                 notes = stock_flow_notes(stock_flow, north)
-                if notes or (north is not None and not north.empty):
-                    st.markdown("##### 资金面")
-                    if stock_flow is not None and not stock_flow.empty and "main_net_inflow" in stock_flow.columns:
-                        latest_main = stock_flow["main_net_inflow"].iloc[-1]
-                        sum_5 = pd.to_numeric(stock_flow["main_net_inflow"].tail(5), errors="coerce").sum()
-                        fc1, fc2, fc3 = st.columns(3)
-                        fc1.metric("主力净流入", format_wan(latest_main))
-                        fc2.metric("近5日主力", format_wan(sum_5))
-                        regime = northbound_regime(north) if north is not None else {}
-                        fc3.metric("北向5日", format_wan(regime.get("window_sum")))
+                st.markdown("##### 资金面")
+                if stock_flow is not None and not stock_flow.empty and "main_net_inflow" in stock_flow.columns:
+                    latest_main = stock_flow["main_net_inflow"].iloc[-1]
+                    sum_5 = pd.to_numeric(stock_flow["main_net_inflow"].tail(5), errors="coerce").sum()
+                    fc1, fc2, fc3 = st.columns(3)
+                    fc1.metric("主力净流入", format_wan(latest_main))
+                    fc2.metric("近5日主力", format_wan(sum_5))
+                    regime = northbound_regime(north) if north is not None else {}
+                    fc3.metric("北向5日", format_wan(regime.get("window_sum")))
                     if notes:
                         st.caption("；".join(notes))
-            except Exception:
-                pass
+                else:
+                    st.info("个股资金序列暂不可用。")
+                    reason = describe_data_problems(stock_flow)
+                    if reason:
+                        st.caption(reason)
+                    if north is not None and not north.empty:
+                        regime = northbound_regime(north)
+                        st.caption(regime.get("note") or "")
+            except Exception as flow_exc:
+                st.caption(f"资金面暂不可用: {flow_exc}")
             
             # 2. 止损止盈建议
             if show_stop_loss:

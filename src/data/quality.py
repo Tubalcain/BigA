@@ -966,15 +966,66 @@ def stamp_flow(
     period=None,
     direction=None,
 ):
-    """stamp_frame + 资金流元数据（单位 / 类型 / 周期）。"""
+    """stamp_frame + 资金流元数据（单位 / 类型 / 周期）。period 必须是实际拿到的周期。"""
     work = stamp_frame(df, source, error=error, issues=issues)
     work.attrs["unit"] = unit or "万元"
     if flow_type:
         work.attrs["flow_type"] = flow_type
     if period:
         work.attrs["period"] = period
+        work.attrs.setdefault("actual_period", period)
     if direction:
         work.attrs["direction"] = direction
+    return work
+
+
+def attach_rank_scope(
+    df,
+    requested_period=None,
+    actual_period=None,
+    requested_sector=None,
+    actual_sector=None,
+):
+    """记录请求 vs 实际周期/板块，回退时写入 issues（如 period_fallback:5日→今日）。"""
+    if df is None:
+        return df
+    work = df.copy()
+    work.attrs.update(df.attrs)
+    actual_p = normalize_flow_indicator(actual_period) if actual_period else (
+        normalize_flow_indicator(work.attrs.get("actual_period") or work.attrs.get("period"))
+        if (work.attrs.get("actual_period") or work.attrs.get("period"))
+        else None
+    )
+    requested_p = (
+        normalize_flow_indicator(requested_period)
+        if requested_period
+        else actual_p
+    )
+    actual_s = normalize_sector_type(actual_sector) if actual_sector else work.attrs.get("actual_sector")
+    requested_s = (
+        normalize_sector_type(requested_sector)
+        if requested_sector
+        else actual_s
+    )
+    issues = list(work.attrs.get("issues") or [])
+    if requested_p and actual_p and requested_p != actual_p:
+        msg = f"period_fallback:{requested_p}→{actual_p}"
+        if msg not in issues:
+            issues.append(msg)
+    if requested_s and actual_s and requested_s != actual_s:
+        msg = f"sector_fallback:{requested_s}→{actual_s}"
+        if msg not in issues:
+            issues.append(msg)
+    work.attrs["issues"] = issues
+    work.attrs["requested_period"] = requested_p
+    work.attrs["actual_period"] = actual_p
+    work.attrs["period"] = actual_p or requested_p
+    if requested_s:
+        work.attrs["requested_sector"] = requested_s
+    if actual_s:
+        work.attrs["actual_sector"] = actual_s
+    if actual_p and "period" in work.columns and len(work):
+        work["period"] = actual_p
     return work
 
 
@@ -1115,6 +1166,141 @@ def scale_to_wan(df, columns, unit="yuan"):
     return work
 
 
+def wan_magnitude_issues(df, columns, context="generic"):
+    """换算成万元之后，量级是否还像该市场的资金流。"""
+    if df is None or df.empty:
+        return []
+    seed = None
+    for col in columns or ():
+        if col in df.columns:
+            seed = to_numeric(df[col]).replace([np.inf, -np.inf], np.nan).dropna()
+            if not seed.empty:
+                break
+    if seed is None or seed.empty:
+        return []
+    med = float(seed.abs().median())
+    n = int(len(seed))
+    if context in ("northbound", "southbound", "cross_border"):
+        if med >= 5e7:
+            return ["unit_sanity: converted northbound median too large for 万元"]
+        if n >= 5 and 0 < med < 1000:
+            return ["unit_sanity: converted northbound median too small for 万元"]
+        return []
+    if med >= 1e8:
+        return ["unit_sanity: converted flow median too large for 万元"]
+    return []
+
+
+def scale_money_to_wan(work, money_cols, amount_unit, context="generic"):
+    """
+    显式单位优先；仅当单位是 auto/空，或显式换算后量级不合理时，才用 infer。
+    返回 (df, used_unit, extra_issues)。
+    """
+    extra = []
+    money_cols = [c for c in (money_cols or []) if c in getattr(work, "columns", [])]
+    requested = amount_unit
+    if amount_unit in (None, "", "auto"):
+        used = _resolve_amount_unit(work, "auto", context, money_cols)
+    else:
+        used = amount_unit
+    scaled = scale_to_wan(work, money_cols, used)
+    sanity = wan_magnitude_issues(scaled, money_cols, context)
+    if sanity and requested not in (None, "", "auto"):
+        raw_seed = work[money_cols[0]] if money_cols and money_cols[0] in work.columns else None
+        alt = infer_amount_unit(raw_seed, context=context)
+        if alt and alt != used:
+            scaled_alt = scale_to_wan(work, money_cols, alt)
+            if not wan_magnitude_issues(scaled_alt, money_cols, context):
+                extra.append(f"unit_fallback:{used}→{alt}")
+                return scaled_alt, alt, extra
+        extra.extend(sanity)
+        return scaled, used, extra
+    extra.extend(sanity)
+    return scaled, used, extra
+
+
+def flag_flow_spikes(df, column, z=8.0):
+    """时间序列：相对中位数过大的点记 is_spike，不因此判整表失败。"""
+    if df is None or df.empty:
+        return df
+    work = df.copy()
+    work.attrs.update(df.attrs)
+    if column not in work.columns:
+        work["is_spike"] = False
+        return work
+    series = to_numeric(work[column])
+    med = float(series.abs().median()) if series.notna().any() else 0.0
+    if med > 0:
+        work["is_spike"] = series.abs() > (med * float(z))
+    else:
+        work["is_spike"] = False
+    n_spike = int(pd.Series(work["is_spike"]).fillna(False).astype(bool).sum())
+    if n_spike:
+        issues = list(work.attrs.get("issues") or [])
+        msg = f"spike_flags:{n_spike}"
+        if msg not in issues:
+            issues.append(msg)
+        work.attrs["issues"] = issues
+    return work
+
+
+_HARD_FLOW_ISSUE_MARKERS = (
+    "empty frame",
+    "missing column",
+    "missing name/code",
+    "missing inflow",
+    "all null",
+    "net_inflow all null",
+    "inflow all null",
+    "all-zero amounts",
+    "null dates",
+    "duplicate dates remain",
+    "dates not sorted",
+    "no usable flow columns",
+)
+
+
+def _ok_from_flow_issues(issues):
+    for item in issues or []:
+        text = str(item)
+        if any(marker in text for marker in _HARD_FLOW_ISSUE_MARKERS):
+            return False
+    return True
+
+
+def _bucket_consistency_issues(df):
+    if df is None or df.empty:
+        return []
+    needed = ("main_net_inflow", "super_large_net", "large_net")
+    if not all(col in df.columns for col in needed):
+        return []
+    main = to_numeric(df["main_net_inflow"])
+    recon = to_numeric(df["super_large_net"]) + to_numeric(df["large_net"])
+    both = main.notna() & recon.notna()
+    if int(both.sum()) < 3:
+        return []
+    diff = (main - recon).abs()
+    scale = main.abs().clip(lower=1.0)
+    bad = both & (diff > 10.0) & ((diff / scale) > 0.05)
+    if float(bad[both].mean()) > 0.2:
+        return ["main_net inconsistent with super_large+large"]
+    return []
+
+
+def _all_zero_amount_issues(df, columns):
+    present = [c for c in columns if c in getattr(df, "columns", [])]
+    if not present:
+        return []
+    zeros = []
+    for col in present:
+        series = to_numeric(df[col])
+        if series.notna().any() and bool((series.fillna(0) == 0).all()):
+            zeros.append(col)
+    if zeros and len(zeros) == len(present):
+        return ["all-zero amounts"]
+    return []
+
+
 def _fill_flow_aliases(work):
     if "net_inflow" not in work.columns and "main_net_inflow" in work.columns:
         work["net_inflow"] = work["main_net_inflow"]
@@ -1146,7 +1332,9 @@ def validate_flow_rank(df):
         issues.append("missing name/code")
     if "net_inflow" in df.columns and df["net_inflow"].notna().sum() == 0:
         issues.append("net_inflow all null")
-    return len(issues) == 0, issues
+    issues.extend(_all_zero_amount_issues(df, ["net_inflow", "main_net_inflow"]))
+    issues.extend(_bucket_consistency_issues(df))
+    return _ok_from_flow_issues(issues), issues
 
 
 def validate_stock_flow(df):
@@ -1160,6 +1348,8 @@ def validate_stock_flow(df):
         issues.append("missing inflow column")
     elif all(df[c].notna().sum() == 0 for c in money):
         issues.append("inflow all null")
+    issues.extend(_all_zero_amount_issues(df, money or ["net_inflow"]))
+    issues.extend(_bucket_consistency_issues(df))
     if "date" in df.columns:
         if df["date"].isna().any():
             issues.append("null dates")
@@ -1167,7 +1357,7 @@ def validate_stock_flow(df):
             issues.append("duplicate dates remain")
         if not df["date"].is_monotonic_increasing:
             issues.append("dates not sorted")
-    return len(issues) == 0, issues
+    return _ok_from_flow_issues(issues), issues
 
 
 def validate_cross_border(df):
@@ -1178,6 +1368,7 @@ def validate_cross_border(df):
         issues.append("missing column: date")
     if "net_inflow" not in df.columns and "north_inflow" not in df.columns:
         issues.append("missing inflow column")
+    issues.extend(_all_zero_amount_issues(df, ["net_inflow", "north_inflow", "south_inflow"]))
     if "date" in df.columns:
         if df["date"].isna().any():
             issues.append("null dates")
@@ -1185,7 +1376,7 @@ def validate_cross_border(df):
             issues.append("duplicate dates remain")
         if not df["date"].is_monotonic_increasing:
             issues.append("dates not sorted")
-    return len(issues) == 0, issues
+    return _ok_from_flow_issues(issues), issues
 
 
 def validate_market_flow(df):
@@ -1196,6 +1387,8 @@ def validate_market_flow(df):
         issues.append("missing column: date")
     if "main_net_inflow" not in df.columns and "net_inflow" not in df.columns:
         issues.append("missing inflow column")
+    issues.extend(_all_zero_amount_issues(df, ["main_net_inflow", "net_inflow"]))
+    issues.extend(_bucket_consistency_issues(df))
     if "date" in df.columns:
         if df["date"].isna().any():
             issues.append("null dates")
@@ -1203,12 +1396,18 @@ def validate_market_flow(df):
             issues.append("duplicate dates remain")
         if not df["date"].is_monotonic_increasing:
             issues.append("dates not sorted")
-    return len(issues) == 0, issues
+    return _ok_from_flow_issues(issues), issues
 
 
-def _finalize_flow(work, source, empty_factory, validator, error=None, **meta):
+def _finalize_flow(work, source, empty_factory, validator, error=None, extra_issues=None, **meta):
+    prior = list(work.attrs.get("issues") or [])
     ok, issues = validator(work)
-    issues = list(issues)
+    merged = []
+    for item in list(issues) + prior + list(extra_issues or []):
+        if item and item not in merged:
+            merged.append(item)
+    issues = merged
+    ok = _ok_from_flow_issues(issues)
     work.attrs["ok"] = ok
     work.attrs["issues"] = issues
     if error:
@@ -1241,8 +1440,7 @@ def prepare_flow_rank(
     work = _fill_flow_aliases(work)
 
     money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
-    unit = _resolve_amount_unit(work, amount_unit, flow_type, money_cols)
-    work = scale_to_wan(work, money_cols, unit)
+    work, used_unit, unit_issues = scale_money_to_wan(work, money_cols, amount_unit, context=flow_type)
 
     if "code" in work.columns:
         work["code"] = work["code"].map(normalize_stock_code)
@@ -1256,7 +1454,11 @@ def prepare_flow_rank(
     if not keep:
         return empty_flow(source, error=error, issues=["no usable flow columns"])
     work = stamp_flow(work[keep], source, unit="万元", flow_type=flow_type, period=period)
-    return _finalize_flow(work, source, empty_flow, validate_flow_rank, error=error)
+    work.attrs["amount_unit_in"] = used_unit
+    work.attrs["actual_period"] = period
+    return _finalize_flow(
+        work, source, empty_flow, validate_flow_rank, error=error, extra_issues=unit_issues
+    )
 
 
 def prepare_stock_flow(
@@ -1294,8 +1496,7 @@ def prepare_stock_flow(
     work = _fill_flow_aliases(work)
 
     money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
-    unit = _resolve_amount_unit(work, amount_unit, "stock", money_cols)
-    work = scale_to_wan(work, money_cols, unit)
+    work, used_unit, unit_issues = scale_money_to_wan(work, money_cols, amount_unit, context="stock")
 
     symbol = normalize_stock_code(code) if code else ""
     if symbol:
@@ -1309,11 +1510,24 @@ def prepare_stock_flow(
     work = work.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     work = filter_date_range(work, start, end)
     swapped = bool(work.attrs.get("date_range_swapped"))
-    keep = [c for c in STOCK_FLOW_COLUMNS if c in work.columns]
-    work = stamp_flow(work[keep].reset_index(drop=True), source, unit="万元", flow_type="stock")
+    spike_col = "main_net_inflow" if "main_net_inflow" in work.columns else "net_inflow"
+    work = flag_flow_spikes(work, spike_col)
+    prior_issues = list(work.attrs.get("issues") or [])
+    keep = [c for c in STOCK_FLOW_COLUMNS + ["is_spike"] if c in work.columns]
+    work = stamp_flow(
+        work[keep].reset_index(drop=True),
+        source,
+        unit="万元",
+        flow_type="stock",
+        issues=prior_issues or None,
+    )
+    work.attrs["amount_unit_in"] = used_unit
     if swapped:
         work.attrs["date_range_swapped"] = True
-    out = _finalize_flow(work, source, empty_stock_flow, validate_stock_flow, error=error)
+    extra_issues = list(unit_issues) + [i for i in prior_issues if str(i).startswith("spike_flags:")]
+    out = _finalize_flow(
+        work, source, empty_stock_flow, validate_stock_flow, error=error, extra_issues=extra_issues
+    )
     if swapped:
         issues = list(out.attrs.get("issues") or [])
         if "start/end dates swapped" not in issues:
@@ -1371,8 +1585,9 @@ def prepare_cross_border(
             dropped_south = True
 
     money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
-    unit = _resolve_amount_unit(work, amount_unit, "cross_border", money_cols or ["net_inflow"])
-    work = scale_to_wan(work, money_cols, unit)
+    work, used_unit, unit_issues = scale_money_to_wan(
+        work, money_cols or ["net_inflow"], amount_unit, context="cross_border"
+    )
     work["direction"] = direction
     if source:
         work["source"] = source
@@ -1381,16 +1596,22 @@ def prepare_cross_border(
     work = work.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     work = filter_date_range(work, start, end)
     swapped = bool(work.attrs.get("date_range_swapped"))
-    keep = [c for c in CROSS_BORDER_COLUMNS if c in work.columns]
+    spike_col = "net_inflow" if "net_inflow" in work.columns else "north_inflow"
+    work = flag_flow_spikes(work, spike_col)
+    prior_issues = list(work.attrs.get("issues") or [])
+    keep = [c for c in CROSS_BORDER_COLUMNS + ["is_spike"] if c in work.columns]
     work = stamp_flow(
         work[keep].reset_index(drop=True),
         source,
         unit="万元",
         flow_type="cross_border",
         direction=direction,
+        issues=prior_issues or None,
     )
+    work.attrs["amount_unit_in"] = used_unit
     if swapped:
         work.attrs["date_range_swapped"] = True
+    extra_issues = list(unit_issues) + [i for i in prior_issues if str(i).startswith("spike_flags:")]
     out = _finalize_flow(
         work,
         source,
@@ -1399,6 +1620,7 @@ def prepare_cross_border(
         ),
         validate_cross_border,
         error=error,
+        extra_issues=extra_issues,
     )
     if dropped_south:
         issues = list(out.attrs.get("issues") or [])
@@ -1445,8 +1667,7 @@ def prepare_market_flow(
         work["main_net_inflow"] = work["net_inflow"]
 
     money_cols = [c for c in FLOW_MONEY_COLUMNS if c in work.columns]
-    unit = _resolve_amount_unit(work, amount_unit, "market", money_cols)
-    work = scale_to_wan(work, money_cols, unit)
+    work, used_unit, unit_issues = scale_money_to_wan(work, money_cols, amount_unit, context="market")
     if source:
         work["source"] = source
 
@@ -1454,11 +1675,24 @@ def prepare_market_flow(
     work = work.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     work = filter_date_range(work, start, end)
     swapped = bool(work.attrs.get("date_range_swapped"))
-    keep = [c for c in MARKET_FLOW_COLUMNS if c in work.columns]
-    work = stamp_flow(work[keep].reset_index(drop=True), source, unit="万元", flow_type="market")
+    spike_col = "main_net_inflow" if "main_net_inflow" in work.columns else "net_inflow"
+    work = flag_flow_spikes(work, spike_col)
+    prior_issues = list(work.attrs.get("issues") or [])
+    keep = [c for c in MARKET_FLOW_COLUMNS + ["is_spike"] if c in work.columns]
+    work = stamp_flow(
+        work[keep].reset_index(drop=True),
+        source,
+        unit="万元",
+        flow_type="market",
+        issues=prior_issues or None,
+    )
+    work.attrs["amount_unit_in"] = used_unit
     if swapped:
         work.attrs["date_range_swapped"] = True
-    out = _finalize_flow(work, source, empty_market_flow, validate_market_flow, error=error)
+    extra_issues = list(unit_issues) + [i for i in prior_issues if str(i).startswith("spike_flags:")]
+    out = _finalize_flow(
+        work, source, empty_market_flow, validate_market_flow, error=error, extra_issues=extra_issues
+    )
     if swapped:
         issues = list(out.attrs.get("issues") or [])
         if "start/end dates swapped" not in issues:

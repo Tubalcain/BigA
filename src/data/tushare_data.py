@@ -27,6 +27,7 @@ from .quality import (
     empty_overview,
     empty_quotes,
     empty_stock_flow,
+    attach_rank_scope,
     infer_limit_pct,
     match_exchange,
     normalize_adjust,
@@ -577,9 +578,18 @@ class TuShareData:
         return self.get_sector_fund_flow(indicator=indicator, allow_fallback=allow_fallback)
 
     def get_sector_fund_flow(self, indicator="今日", sector_type="行业资金流", allow_fallback=True):
-        """行业 / 概念 / 地域资金流。优先东财行业接口（需积分），失败回退 AKShare。"""
+        """行业 / 概念 / 地域资金流。东财行业接口是日频，多日周期不假装成功。"""
         period = normalize_flow_indicator(indicator)
         sector = normalize_sector_type(sector_type)
+        if period != "今日":
+            if allow_fallback:
+                alt = self._try_peer("get_sector_fund_flow", period, sector, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
+            empty = empty_flow("tushare", issues=["tushare sector is daily only"])
+            empty.attrs["requested_period"] = period
+            empty.attrs["requested_sector"] = sector
+            return empty
         if not self.is_available():
             if allow_fallback:
                 alt = self._try_peer("get_sector_fund_flow", period, sector, allow_fallback=False)
@@ -600,8 +610,15 @@ class TuShareData:
             )
             if raw is None or raw.empty:
                 return empty_flow("tushare", issues=["tushare sector fund flow unavailable"])
-            return prepare_flow_rank(
-                raw, source="tushare", period=period, flow_type="sector", amount_unit="yuan"
+            df = prepare_flow_rank(
+                raw, source="tushare", period="今日", flow_type="sector", amount_unit="yuan"
+            )
+            return attach_rank_scope(
+                df,
+                requested_period=period,
+                actual_period="今日",
+                requested_sector=sector,
+                actual_sector=sector,
             )
 
         result = self._cached(
@@ -619,8 +636,16 @@ class TuShareData:
         return result
 
     def get_stock_fund_flow_rank(self, indicator="今日", allow_fallback=True):
-        """最近交易日全市场 moneyflow 排名。多日周期回退 AKShare。"""
+        """最近交易日全市场 moneyflow 排名。多日周期不盖假章，回退 AKShare。"""
         period = normalize_flow_indicator(indicator)
+        if period != "今日":
+            if allow_fallback:
+                alt = self._try_peer("get_stock_fund_flow_rank", period, allow_fallback=False)
+                if alt is not None and not alt.empty:
+                    return alt
+            empty = empty_flow("tushare", issues=["tushare stock rank is daily only"])
+            empty.attrs["requested_period"] = period
+            return empty
         if not self.is_available():
             if allow_fallback:
                 alt = self._try_peer("get_stock_fund_flow_rank", period, allow_fallback=False)
@@ -629,8 +654,6 @@ class TuShareData:
             return empty_flow("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
-            if period != "今日":
-                return empty_flow("tushare", issues=["tushare stock rank is daily only"])
             trade_date = self._latest_open_date()
             api = getattr(self._pro, "moneyflow", None)
             if api is None or not trade_date:
@@ -648,9 +671,10 @@ class TuShareData:
             names = self._code_name_map()
             if names and "code" in work.columns:
                 work["name"] = work["code"].map(lambda c: names.get(c, c))
-            return prepare_flow_rank(
-                work, source="tushare", period=period, flow_type="stock", amount_unit="wan"
+            df = prepare_flow_rank(
+                work, source="tushare", period="今日", flow_type="stock", amount_unit="wan"
             )
+            return attach_rank_scope(df, requested_period=period, actual_period="今日")
 
         result = self._cached(
             ("stock_fund_flow_rank", period),

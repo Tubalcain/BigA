@@ -1,5 +1,5 @@
 """
-资金流向分析：排名、主力/散户、趋势、北向状态、量价背离。
+资金流向分析：排名、主力/散户、趋势、北向状态、价资背离。
 
 输入是 quality.prepare_* 之后的标准表（金额单位：万元）。
 页面只做展示，计算放在这里。
@@ -11,6 +11,8 @@ import math
 
 import numpy as np
 import pandas as pd
+
+from src.data.quality import sector_type_short
 
 
 def format_wan(value, na="-"):
@@ -30,19 +32,70 @@ def format_wan(value, na="-"):
     return f"{sign}{abs_value:.2f}万"
 
 
-def unit_caption(df, fallback_source=""):
+def actual_period_label(df, requested=None):
+    if df is not None:
+        actual = df.attrs.get("actual_period") or df.attrs.get("period")
+        if actual:
+            return actual
+    return requested or ""
+
+
+def actual_sector_label(df, requested=None):
+    raw = None
+    if df is not None:
+        raw = df.attrs.get("actual_sector") or df.attrs.get("requested_sector")
+    raw = raw or requested or ""
+    return sector_type_short(raw) if raw else ""
+
+
+def scope_fallback_note(df, requested_period=None, requested_sector=None):
+    """请求与实际不一致时的短提示。"""
+    if df is None:
+        return ""
+    actual_p = actual_period_label(df, requested_period)
+    requested_p = df.attrs.get("requested_period") or requested_period
+    actual_s = actual_sector_label(df, requested_sector)
+    requested_s = None
+    if df.attrs.get("requested_sector"):
+        requested_s = sector_type_short(df.attrs.get("requested_sector"))
+    elif requested_sector:
+        requested_s = sector_type_short(requested_sector)
+    parts = []
+    if requested_p and actual_p and requested_p != actual_p:
+        parts.append(f"周期已回退 {requested_p}→{actual_p}")
+    if requested_s and actual_s and requested_s != actual_s:
+        parts.append(f"板块已回退 {requested_s}→{actual_s}")
+    return "；".join(parts)
+
+
+def unit_caption(df, fallback_source="", requested_period=None, requested_sector=None):
     if df is None:
         return "无数据"
     source = df.attrs.get("source") or fallback_source or ""
     unit = df.attrs.get("unit") or "万元"
-    period = df.attrs.get("period")
+    period = actual_period_label(df, requested_period)
+    sector = actual_sector_label(df, requested_sector)
     parts = []
     if source:
         parts.append(f"数据来源: {source}")
     parts.append(f"金额单位: {unit}")
     if period:
         parts.append(f"周期: {period}")
+        requested_p = df.attrs.get("requested_period") or requested_period
+        if requested_p and requested_p != period:
+            parts.append(f"请求周期: {requested_p}")
+    if sector:
+        parts.append(f"板块: {sector}")
     return " | ".join(parts)
+
+
+def _is_overlapping_rank(df):
+    if df is None:
+        return False
+    sector = df.attrs.get("actual_sector") or df.attrs.get("requested_sector")
+    if not sector:
+        return False
+    return sector_type_short(sector) in ("概念", "地域")
 
 
 def _ready(df, columns=None):
@@ -91,7 +144,8 @@ def extreme_rows(df, n=15, column="net_inflow"):
 def summarize_rank(df, n=8, column="net_inflow"):
     """排名表一句话摘要：合计、家数、最强/最弱名称。"""
     empty = {
-        "total_net_inflow": 0.0,
+        "total_net_inflow": None,
+        "overlapping": False,
         "inflow_count": 0,
         "outflow_count": 0,
         "top_inflow": [],
@@ -108,8 +162,11 @@ def summarize_rank(df, n=8, column="net_inflow"):
     ranked = ranked.dropna(subset=["_flow"])
     top = ranked.nlargest(int(n), "_flow")
     bottom = ranked.nsmallest(int(n), "_flow")
+    overlapping = _is_overlapping_rank(df)
+    total = None if overlapping else float(values.fillna(0).sum())
     return {
-        "total_net_inflow": float(values.fillna(0).sum()),
+        "total_net_inflow": total,
+        "overlapping": overlapping,
         "inflow_count": int((values > 0).sum()),
         "outflow_count": int((values < 0).sum()),
         "top_inflow": [
@@ -165,6 +222,9 @@ def main_vs_retail(df, main_col="main_net_inflow", retail_col="small_net"):
     if main is not None and retail is not None:
         dominates = abs(main) >= abs(retail)
     note = _main_retail_note(main, retail)
+    overlapping = "date" not in getattr(df, "columns", []) and _is_overlapping_rank(df)
+    if overlapping:
+        note = (note + "；" if note else "") + "概念/地域互相重叠，合计不能当作全市场"
     result.update(
         {
             "main_net_inflow": main,
@@ -172,6 +232,7 @@ def main_vs_retail(df, main_col="main_net_inflow", retail_col="small_net"):
             "main_5d": main_5,
             "retail_5d": retail_5,
             "main_dominates": dominates,
+            "overlapping": overlapping,
             "note": note,
         }
     )
@@ -260,9 +321,17 @@ def northbound_regime(df, window=5, value_col="net_inflow"):
     return result
 
 
-def price_flow_divergence(price_df, flow_df, window=5, flow_col="main_net_inflow"):
+def price_flow_divergence(
+    price_df,
+    flow_df,
+    window=5,
+    flow_col="main_net_inflow",
+    min_abs_pct=0.02,
+    min_abs_flow=100.0,
+):
     """
-    价涨资金出 / 价跌资金进。返回对齐后的明细表（只保留有信号的日期也可由页面再筛）。
+    价资背离：价涨资出 / 价跌资进。只描述方向，不下派发/吸筹结论。
+    min_abs_pct / min_abs_flow 过滤过小波动。
     """
     columns = [
         "date",
@@ -297,18 +366,22 @@ def price_flow_divergence(price_df, flow_df, window=5, flow_col="main_net_inflow
         price_chg, flow_sum = row["price_chg"], row["flow_sum"]
         if pd.isna(price_chg) or pd.isna(flow_sum):
             return ""
+        if abs(float(price_chg)) < float(min_abs_pct):
+            return ""
+        if abs(float(flow_sum)) < float(min_abs_flow or 0):
+            return ""
         if price_chg > 0 and flow_sum < 0:
-            return "价涨资金出（可能派发）"
+            return "价涨资出"
         if price_chg < 0 and flow_sum > 0:
-            return "价跌资金进（可能吸筹）"
+            return "价跌资进"
         if price_chg > 0 and flow_sum > 0:
-            return "价量齐升"
+            return "价资同向（上涨）"
         if price_chg < 0 and flow_sum < 0:
-            return "价量齐跌"
+            return "价资同向（下跌）"
         return ""
 
     merged["note"] = merged.apply(_note, axis=1)
-    merged["divergence"] = merged["note"].isin(["价涨资金出（可能派发）", "价跌资金进（可能吸筹）"])
+    merged["divergence"] = merged["note"].isin(["价涨资出", "价跌资进"])
     out = merged[["date", "close", "price_chg", "flow_sum", "divergence", "note"]].reset_index(drop=True)
     return out
 

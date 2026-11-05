@@ -28,6 +28,7 @@ from .quality import (
     empty_overview,
     empty_quotes,
     empty_stock_flow,
+    attach_rank_scope,
     infer_limit_pct,
     match_exchange,
     normalize_adjust,
@@ -44,6 +45,7 @@ from .quality import (
     prepare_ohlcv,
     prepare_stock_flow,
     rename_columns,
+    scale_money_to_wan,
     stamp_frame,
     to_numeric,
     validate_ohlcv,
@@ -570,23 +572,44 @@ class AKShareData:
 
         def loader():
             ak = self._client()
-            raw = None
             api = getattr(ak, "stock_sector_fund_flow_rank", None)
-            attempts = []
-            if api is not None:
-                attempts.append((f"stock_sector_fund_flow_rank:{period}:{sector}", lambda: api(indicator=period, sector_type=sector)))
-                if sector != "行业资金流":
-                    attempts.append((f"stock_sector_fund_flow_rank:{period}:行业资金流", lambda: api(indicator=period, sector_type="行业资金流")))
-                if period != "今日":
-                    attempts.append(("stock_sector_fund_flow_rank:今日", lambda: api(indicator="今日", sector_type=sector)))
-            for label, func in attempts:
-                raw = self._fetch(func, default=None, label=label, retries=1)
+            if api is None:
+                return empty_flow("akshare", issues=["sector fund flow unavailable"])
+            attempts = [(period, sector)]
+            if period != "今日":
+                attempts.append(("今日", sector))
+            if sector != "行业资金流":
+                attempts.append((period, "行业资金流"))
+            if period != "今日" and sector != "行业资金流":
+                attempts.append(("今日", "行业资金流"))
+            raw = None
+            actual_period, actual_sector = period, sector
+            seen = set()
+            for try_period, try_sector in attempts:
+                key = (try_period, try_sector)
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw = self._fetch(
+                    lambda p=try_period, s=try_sector: api(indicator=p, sector_type=s),
+                    default=None,
+                    label=f"stock_sector_fund_flow_rank:{try_period}:{try_sector}",
+                    retries=1,
+                )
                 if isinstance(raw, pd.DataFrame) and not raw.empty:
+                    actual_period, actual_sector = try_period, try_sector
                     break
             if raw is None or raw.empty:
                 return empty_flow("akshare", issues=["sector fund flow unavailable"])
-            return prepare_flow_rank(
-                raw, source="akshare", period=period, flow_type="sector", amount_unit="yuan"
+            df = prepare_flow_rank(
+                raw, source="akshare", period=actual_period, flow_type="sector", amount_unit="yuan"
+            )
+            return attach_rank_scope(
+                df,
+                requested_period=period,
+                actual_period=actual_period,
+                requested_sector=sector,
+                actual_sector=actual_sector,
             )
 
         result = self._cached(
@@ -616,6 +639,7 @@ class AKShareData:
         def loader():
             ak = self._client()
             raw = None
+            actual_period = period
             api = getattr(ak, "stock_individual_fund_flow_rank", None)
             if api is not None:
                 raw = self._fetch(
@@ -631,10 +655,15 @@ class AKShareData:
                         label="stock_individual_fund_flow_rank:今日",
                         retries=1,
                     )
+                    if isinstance(raw, pd.DataFrame) and not raw.empty:
+                        actual_period = "今日"
             if raw is None or raw.empty:
                 return empty_flow("akshare", issues=["stock fund flow rank unavailable"])
-            return prepare_flow_rank(
-                raw, source="akshare", period=period, flow_type="stock", amount_unit="yuan"
+            df = prepare_flow_rank(
+                raw, source="akshare", period=actual_period, flow_type="stock", amount_unit="yuan"
+            )
+            return attach_rank_scope(
+                df, requested_period=period, actual_period=actual_period
             )
 
         result = self._cached(
@@ -793,7 +822,7 @@ class AKShareData:
                 merged,
                 source="akshare",
                 direction="northbound",
-                amount_unit="auto",
+                amount_unit="wan",
                 start=start_date,
                 end=end_date,
             )
@@ -820,6 +849,7 @@ class AKShareData:
     def _fetch_hsgt_leg(self, symbol, direction):
         ak = self._client()
         raw = None
+        used_api = None
         hist = getattr(ak, "stock_hsgt_hist_em", None)
         if hist is not None:
             raw = self._fetch(
@@ -828,6 +858,8 @@ class AKShareData:
                 label=f"stock_hsgt_hist_em:{symbol}",
                 retries=1,
             )
+            if isinstance(raw, pd.DataFrame) and not raw.empty:
+                used_api = "stock_hsgt_hist_em"
         if (raw is None or (isinstance(raw, pd.DataFrame) and raw.empty)) and direction == "northbound":
             for api_name, kwargs in (
                 ("stock_hsgt_north_net_flow_in_em", {}),
@@ -843,12 +875,20 @@ class AKShareData:
                     retries=1,
                 )
                 if isinstance(raw, pd.DataFrame) and not raw.empty:
+                    used_api = api_name
                     break
         if raw is None or (isinstance(raw, pd.DataFrame) and raw.empty):
             return pd.DataFrame()
         work = rename_columns(raw.copy())
         work = work.copy()
         work["_leg"] = direction
+        # 东财沪深港通历史「当日成交净买额」为万元；north_net_flow_in 多为元。
+        unit = "wan"
+        if used_api == "stock_hsgt_north_net_flow_in_em":
+            unit = "yuan"
+        elif used_api == "stock_hsgt_fund_flow_summary_em":
+            unit = "auto"
+        work["_amount_unit"] = unit
         return work
 
     def get_northbound_flow(self, start_date=None, end_date=None, allow_fallback=True):
@@ -1102,7 +1142,13 @@ def _merge_cross_border(north, south, source="akshare"):
         piece = pd.DataFrame({"date": work["date"], inflow_col: value})
         for extra in ("buy_amount", "sell_amount", "买入成交额", "卖出成交额"):
             if extra in work.columns:
-                piece[extra] = work[extra]
+                dest = {"买入成交额": "buy_amount", "卖出成交额": "sell_amount"}.get(extra, extra)
+                piece[dest] = work[extra]
+        unit = "wan"
+        if "_amount_unit" in work.columns and len(work):
+            unit = str(work["_amount_unit"].iloc[0] or "wan")
+        money = [c for c in (inflow_col, "buy_amount", "sell_amount") if c in piece.columns]
+        piece, _, _ = scale_money_to_wan(piece, money, unit, context="cross_border")
         frames.append(piece)
     if not frames:
         return pd.DataFrame()
