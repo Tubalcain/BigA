@@ -20,8 +20,8 @@ with st.sidebar:
     stock_code = st.text_input(
         "股票代码",
         value="000001",
-        help="输入6位股票代码，如：000001（平安银行）"
-    )
+        help="6 位代码，如 000001；也可写 000001.SZ"
+    ).strip()
     
     # 数据源选择
     data_source = st.radio(
@@ -68,23 +68,22 @@ if analyze_btn or 'show_analysis' in st.session_state:
     
     # 获取股票基本信息
     try:
-        from src.data.akshare_data import AKShareData
-        from src.data.tushare_data import TuShareData
+        from src.data import describe_data_problems, get_active_client, outlier_count, source_switch_note
         from src.analysis.technical import TechnicalAnalyzer
         from src.visualization.charts import PlotlyChartGenerator
         
-        # 选择数据源
-        if data_source == "AKShare":
-            data_obj = AKShareData()
-        else:
-            data_obj = TuShareData()
-            if not data_obj.is_available():
-                st.warning("TuShare未配置，切换为AKShare")
-                data_obj = AKShareData()
-                data_source = "AKShare"
+        preferred = "akshare" if data_source == "AKShare" else "tushare"
+        data_obj = get_active_client(preferred)
+        note = source_switch_note(preferred, data_obj)
+        if note:
+            st.warning(note)
+            data_source = "AKShare" if getattr(data_obj, "name", "") == "akshare" else "TuShare"
+
+        if start_date > end_date:
+            st.warning("开始日期晚于结束日期，已按时间顺序交换。")
+            start_date, end_date = end_date, start_date
         
         with st.spinner("正在获取数据..."):
-            # 获取历史数据
             hist_data = data_obj.get_history_data(
                 stock_code,
                 start_date.strftime('%Y%m%d'),
@@ -93,9 +92,16 @@ if analyze_btn or 'show_analysis' in st.session_state:
         
         # 调试信息
         if not hist_data.empty:
-            st.success(f"✓ 成功获取 {len(hist_data)} 条数据")
+            used_source = hist_data.attrs.get("source") or data_source
+            st.success(f"✓ 成功获取 {len(hist_data)} 条数据（来源: {used_source}）")
+            if hist_data.attrs.get("date_range_swapped"):
+                st.caption("开始/结束日期已按时间顺序交换。")
+            n_out = outlier_count(hist_data)
+            if n_out:
+                st.caption(f"有 {n_out} 根 K 线涨跌幅异常（is_outlier），已保留。")
             with st.expander("🔍 调试信息（点击查看数据列名）"):
                 st.write("数据列名:", list(hist_data.columns))
+                st.write("attrs:", {k: hist_data.attrs.get(k) for k in ("source", "timezone", "issues", "ok")})
                 st.write("前5行数据:")
                 st.dataframe(hist_data.head())
         
@@ -180,6 +186,9 @@ if analyze_btn or 'show_analysis' in st.session_state:
             
         else:
             st.error(f"❌ 未能获取股票 {stock_code} 的数据")
+            msg = describe_data_problems(hist_data)
+            if msg:
+                st.caption(msg)
             
             with st.expander("🆘 可能的原因和解决方案"):
                 st.markdown("""
@@ -199,7 +208,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
                 - 稍后再试
                 
                 ### 测试数据源：
-                可以运行 `python test_stock.py` 来测试数据源是否可用
+                可以运行 `python examples/test_data_source.py` 来测试数据源是否可用
                 """)
     
     except Exception as e:
@@ -214,7 +223,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
         1. 检查股票代码格式是否正确（6位数字）
         2. 尝试使用其他数据源（AKShare/TuShare）
         3. 稍后重试
-        4. 运行测试脚本：`python test_stock.py`
+        4. 运行测试脚本：`python examples/test_data_source.py`
         """)
 
 else:
@@ -258,5 +267,5 @@ indicators = ["MA", "MACD", "RSI"]
 
 # 页脚
 st.markdown("---")
-st.caption("数据来源: AKShare / TuShare | 更新时间: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+st.caption("数据来源: AKShare / TuShare（可回退） | 更新时间: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 

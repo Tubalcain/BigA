@@ -25,8 +25,8 @@ with st.sidebar:
     stock_code = st.text_input(
         "股票代码",
         value="000001",
-        help="输入6位股票代码"
-    )
+        help="6 位代码，如 000001；也可写 000001.SZ"
+    ).strip()
     
     # 时间周期
     st.subheader("📅 时间周期")
@@ -104,7 +104,7 @@ if analyze_btn or 'analyze' in st.session_state:
         st.session_state.analyze = True
     
     try:
-        from src.data.akshare_data import AKShareData
+        from src.data import describe_data_problems, get_active_client, outlier_count, source_switch_note
         from src.analysis.trading_signals import TradingSignalAnalyzer
         from src.analysis.trading_signals_optimized import OptimizedTradingSignalAnalyzer
         from src.analysis.advanced_trading import AdvancedTradingAnalyzer
@@ -113,18 +113,27 @@ if analyze_btn or 'analyze' in st.session_state:
         
         # 获取数据
         with st.spinner("正在获取数据..."):
-            ak_data = AKShareData()
+            preferred = st.session_state.get("data_source", "akshare")
+            ak_data = get_active_client(preferred)
+            note = source_switch_note(preferred, ak_data)
+            if note:
+                st.caption(note)
             
             end_date = datetime.now()
             start_date = end_date - timedelta(days=period)
             
+            period_map = {"日线": "daily", "周线": "weekly", "月线": "monthly"}
             hist_data = ak_data.get_history_data(
                 stock_code,
                 start_date.strftime('%Y%m%d'),
-                end_date.strftime('%Y%m%d')
+                end_date.strftime('%Y%m%d'),
+                period=period_map.get(time_frame, "daily"),
             )
         
         if not hist_data.empty:
+            n_out = outlier_count(hist_data)
+            if n_out:
+                st.caption(f"有 {n_out} 根 K 线涨跌幅异常（is_outlier），已保留。")
             # 标准化数据
             if 'date' in hist_data.columns:
                 hist_data['date'] = pd.to_datetime(hist_data['date'])
@@ -452,7 +461,10 @@ if analyze_btn or 'analyze' in st.session_state:
             
         else:
             st.error(f"❌ 未能获取股票 {stock_code} 的数据")
-            st.info("💡 提示：请检查股票代码是否正确")
+            msg = describe_data_problems(hist_data)
+            if msg:
+                st.caption(msg)
+            st.info("💡 提示：请检查股票代码是否为 6 位数字（也可写 000001.SZ）")
     
     except Exception as e:
         st.error(f"❌ 分析过程中发生错误: {str(e)}")

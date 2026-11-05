@@ -48,11 +48,14 @@ def validate_stock_code(code):
     
     # 检查是否为6位数字
     if re.match(r'^[0-9]{6}$', code):
-        # 深圳股票：00xxxx, 30xxxx
+        # 深圳：00/001/002/003 主板中小盘, 30 创业板
         if code.startswith('00') or code.startswith('30'):
             return True
-        # 上海股票：60xxxx, 68xxxx
-        elif code.startswith('60') or code.startswith('68'):
+        # 上海：60 主板, 68 科创板
+        if code.startswith('60') or code.startswith('68'):
+            return True
+        # 北京证券交易所
+        if code.startswith('8') or code.startswith('4'):
             return True
     
     return False
@@ -93,10 +96,11 @@ def get_exchange_from_code(code):
     """
     if code.startswith('00') or code.startswith('30'):
         return '深圳交易所'
-    elif code.startswith('60') or code.startswith('68'):
+    if code.startswith('60') or code.startswith('68'):
         return '上海交易所'
-    else:
-        return '未知'
+    if code.startswith('8') or code.startswith('4'):
+        return '北京交易所'
+    return '未知'
 
 
 def format_date(date_str, format='%Y-%m-%d'):
@@ -276,14 +280,15 @@ def get_stock_board(code):
     """
     if code.startswith('00'):
         return '深市主板'
-    elif code.startswith('30'):
+    if code.startswith('30'):
         return '创业板'
-    elif code.startswith('60'):
+    if code.startswith('60'):
         return '沪市主板'
-    elif code.startswith('68'):
+    if code.startswith('68'):
         return '科创板'
-    else:
-        return '未知板块'
+    if code.startswith('8') or code.startswith('4'):
+        return '北交所'
+    return '未知板块'
 
 
 if __name__ == "__main__":

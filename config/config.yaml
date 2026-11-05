@@ -7,19 +7,32 @@ app:
   debug: true
 
 # Data Sources Configuration
+# Secrets: set TUSHARE_TOKEN in the environment or a local .env file.
+# Do not commit a real token here.
 data_sources:
-  # TuShare Pro - 推荐使用，数据质量高
+  primary: akshare
+  fallback: true  # 主源失败时自动尝试另一源
+
+  # TuShare Pro - 数据质量高，需要积分/权限
   tushare:
     enabled: true
-    token: ""  # 需要从 https://tushare.pro 获取
+    token: ""  # 留空，改用环境变量 TUSHARE_TOKEN
     base_url: "http://api.tushare.pro"
     timeout: 30
-  
-  # AKShare - 免费开源，无需注册
+    retries: 3
+
+  # AKShare - 免费开源，无需注册，默认主源
   akshare:
     enabled: true
     base_url: "https://akshare.akfamily.xyz"
     timeout: 30
+    retries: 3
+    adjust: ""  # "" 不复权, qfq 前复权, hfq 后复权
+
+# Data quality / cleaning
+data_quality:
+  max_abs_return: 1.0   # 单日涨跌超过该阈值标记 is_outlier
+  drop_outlier_bars: false
 
 # Analysis Settings
 analysis:
@@ -64,8 +77,12 @@ visualization:
 # Cache Settings
 cache:
   enabled: true
-  ttl: 300  # 缓存时间 5分钟
+  ttl: 300            # 历史行情默认 5 分钟
+  ttl_realtime: 30    # 快照 / 指数 / 资金流
+  ttl_list: 3600      # 股票列表 / 基本信息
+  ttl_calendar: 86400 # 交易日历
   max_size: 1000
+  directory: "data/cache"
 
 # UI Settings
 ui:
