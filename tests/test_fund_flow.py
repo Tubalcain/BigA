@@ -17,6 +17,7 @@ from src.analysis.fund_flow import (
     STOCK_BIAS_LEGS,
     apply_fund_flow_bias,
     divergence_reading,
+    frame_quality_ok,
     enrich_sector_flow,
     extreme_rows,
     flow_acceleration,
@@ -25,6 +26,7 @@ from src.analysis.fund_flow import (
     latest_stock_snapshot,
     main_vs_retail,
     market_fund_bias,
+    market_legs_used,
     northbound_regime,
     price_flow_divergence,
     rank_inflow,
@@ -582,6 +584,46 @@ class FlowBiasTests(unittest.TestCase):
         self.assertEqual(market_page["scope"], "market")
         self.assertEqual(market_page["legs_used"], MARKET_BIAS_LEGS)
         self.assertNotEqual(market_page["legs_used"], analysis_page["legs_used"])
+        self.assertIn("板块榜", MARKET_BIAS_LEGS)
+        self.assertNotIn("行业榜", MARKET_BIAS_LEGS)
+
+    def test_market_legs_label_follows_sector_type(self):
+        market = self._series([80, 90, 100, 110, 120, 130])
+        industry = pd.DataFrame({"name": ["银行", "半导体", "煤炭"], "net_inflow": [800, 600, -50]})
+        industry.attrs["actual_sector"] = "行业资金流"
+        industry_bias = market_fund_bias(market_df=market, sector_rank=industry)
+        self.assertIn("行业榜", industry_bias["legs_used"])
+        self.assertNotIn("不计入", industry_bias["legs_used"])
+        concept = pd.DataFrame({"name": ["人工智能", "ChatGPT", "算力"], "net_inflow": [9000, 8000, 7000]})
+        concept.attrs["actual_sector"] = "概念资金流"
+        concept_bias = market_fund_bias(market_df=market, sector_rank=concept)
+        self.assertIn("概念榜", concept_bias["legs_used"])
+        self.assertIn("不计入方向", concept_bias["legs_used"])
+        self.assertNotIn("行业榜", concept_bias["legs_used"])
+        region = pd.DataFrame({"name": ["上海", "深圳"], "net_inflow": [100, -40]})
+        region.attrs["actual_sector"] = "地域资金流"
+        region_label = market_legs_used(region, {"sector": {"overlapping": True, "usable_for_rotation": False}})
+        self.assertIn("地域榜", region_label)
+        self.assertIn("重叠", region_label)
+
+    def test_ohlcv_issues_without_ok_skip_divergence(self):
+        dates = pd.date_range("2024-01-01", periods=8, freq="D")
+        price = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
+        price.attrs["issues"] = ["high < low", "invalid close"]
+        stock = pd.DataFrame({"date": dates, "main_net_inflow": [100, 80, -50, -80, -90, -100, -120, -150]})
+        market = self._series([-80, -90, -100, -110, -120, -130, -140, -150])
+        self.assertFalse(frame_quality_ok(price))
+        self.assertTrue(frame_quality_ok(stock))
+        bias = fund_flow_bias(market_df=market, stock_flow=stock, price_df=price)
+        div = bias["components"].get("divergence") or {}
+        self.assertTrue(div.get("skipped"))
+        blob = " ".join(bias["evidence"])
+        self.assertIn("价格数据质量不足", blob)
+        self.assertNotIn("价涨资出", blob)
+        self.assertEqual(bias["bias"], "偏空")
+        price2 = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
+        price2.attrs["issues"] = ["null close", "fewer than 60 bars"]
+        self.assertFalse(frame_quality_ok(price2))
 
 
 class FlowAdapterEmptyTests(unittest.TestCase):

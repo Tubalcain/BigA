@@ -189,6 +189,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
                 from src.analysis.fund_flow import (
                     bias_display,
                     format_wan,
+                    frame_quality_ok,
                     stock_fund_bias,
                     latest_stock_snapshot,
                     main_vs_retail,
@@ -202,8 +203,16 @@ if analyze_btn or 'show_analysis' in st.session_state:
                         start_date.strftime("%Y%m%d"),
                         end_date.strftime("%Y%m%d"),
                     )
-                    north = data_obj.get_northbound_flow()
-                    market_flow = data_obj.get_market_fund_flow()
+                    north = None
+                    market_flow = None
+                    try:
+                        north = data_obj.get_northbound_flow()
+                    except Exception:
+                        north = None
+                    try:
+                        market_flow = data_obj.get_market_fund_flow()
+                    except Exception:
+                        market_flow = None
                 stock_bias = stock_fund_bias(
                     stock_flow=stock_flow,
                     price_df=hist_data,
@@ -242,11 +251,19 @@ if analyze_btn or 'show_analysis' in st.session_state:
                             stock_flow, "date", y_cols, title=f"{stock_code} 主力资金"
                         )
                         st.plotly_chart(fig_flow, use_container_width=True)
-                    diverged = price_flow_divergence(hist_data, stock_flow)
-                    if diverged is not None and not diverged.empty and diverged["divergence"].any():
-                        st.markdown("**价资背离（近窗口）**")
-                        hits = diverged[diverged["divergence"]].tail(8)
-                        st.dataframe(hits, use_container_width=True, hide_index=True)
+                    div_comp = (stock_bias.get("components") or {}).get("divergence") or {}
+                    if (
+                        div_comp.get("skipped")
+                        or not frame_quality_ok(stock_flow)
+                        or not frame_quality_ok(hist_data)
+                    ):
+                        st.caption("价资背离未展示：个股资金或价格表质量未通过。")
+                    else:
+                        diverged = price_flow_divergence(hist_data, stock_flow)
+                        if diverged is not None and not diverged.empty and diverged["divergence"].any():
+                            st.markdown("**价资背离（近窗口）**")
+                            hits = diverged[diverged["divergence"]].tail(8)
+                            st.dataframe(hits, use_container_width=True, hide_index=True)
                     st.caption(unit_caption(stock_flow))
                 else:
                     st.info("该股票暂无主力资金序列（接口限流、停牌或源不支持时会降级）。")

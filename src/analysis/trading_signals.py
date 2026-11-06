@@ -345,7 +345,9 @@ if __name__ == "__main__":
     print("交易建议:")
     print(f"推荐动作: {recommendation['recommendation']}")
     print(f"信心: {recommendation['confidence']}")
-    print(f"综合评分: {recommendation['score']}")
+    print(f"技术评分: {recommendation.get('tech_score', recommendation['score'])}")
+    if recommendation.get("blended_score") is not None:
+        print(f"综合参考分: {recommendation['blended_score']}")
     print(f"\n风险等级: {risk['risk_level']}")
     print(f"波动率: {risk['volatility']:.2%}")
 

@@ -13,7 +13,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from src.data.quality import _ok_from_flow_issues, sector_type_short
+from src.data.quality import _ok_from_flow_issues, _ok_from_ohlcv_issues, sector_type_short
 
 
 def format_wan(value, na="-"):
@@ -524,13 +524,18 @@ def _frame_quality_ok(df):
     if not _frame_ok_flag(df):
         return False
     issues = _collect_frame_issues(df)
-    if not _ok_from_flow_issues(issues):
+    if not _ok_from_flow_issues(issues) or not _ok_from_ohlcv_issues(issues):
         return False
     for item in issues:
         text = str(item)
         if any(marker in text for marker in _EXTRA_HARD_ISSUE_MARKERS):
             return False
     return True
+
+
+def frame_quality_ok(df):
+    """公开质量门控，页面展示与分析层同一套判定。"""
+    return _frame_quality_ok(df)
 
 
 def empty_fund_bias(reason="资金数据不足，不下倾向"):
@@ -979,15 +984,25 @@ def bias_display(bias):
     }
 
 
-MARKET_BIAS_LEGS = "市场主力 / 北向 / 行业榜"
+MARKET_BIAS_LEGS = "市场主力 / 北向 / 板块榜"
 STOCK_BIAS_LEGS = "个股资金 / 价资 / 市场主力 / 北向"
 
 
+def market_legs_used(sector_rank=None, components=None):
+    """市场级维度文案：按实际板块类型写行业/概念/地域榜；重叠榜标明不计入方向。"""
+    short = actual_sector_label(sector_rank)
+    label = f"{short}榜" if short else "板块榜"
+    sector = (components or {}).get("sector") or {}
+    if sector.get("overlapping") or sector.get("usable_for_rotation") is False:
+        return f"市场主力 / 北向 / {label}（重叠，不计入方向）"
+    return f"市场主力 / 北向 / {label}"
+
+
 def market_fund_bias(market_df=None, north_df=None, sector_rank=None):
-    """市场级资金面倾向：大盘主力 + 北向 + 行业榜。不含个股。"""
+    """市场级资金面倾向：大盘主力 + 北向 + 板块榜。不含个股。"""
     result = fund_flow_bias(market_df=market_df, north_df=north_df, sector_rank=sector_rank)
     result["scope"] = "market"
-    result["legs_used"] = MARKET_BIAS_LEGS
+    result["legs_used"] = market_legs_used(sector_rank, result.get("components"))
     result["label"] = "资金面倾向（1–5日·市场级）"
     return result
 
@@ -995,7 +1010,7 @@ def market_fund_bias(market_df=None, north_df=None, sector_rank=None):
 def stock_fund_bias(stock_flow=None, price_df=None, market_df=None, north_df=None):
     """
     个股级资金面倾向。个股分析页与交易决策页必须走这里，输入维度一致：
-    个股资金流 + 价格 + 市场主力 + 北向。不含行业榜（行业轮动只在市场级）。
+    个股资金流 + 价格 + 市场主力 + 北向。不含板块榜（板块轮动只在市场级）。
     """
     result = fund_flow_bias(
         market_df=market_df,

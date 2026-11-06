@@ -1268,6 +1268,32 @@ def _ok_from_flow_issues(issues):
     return True
 
 
+_HARD_OHLCV_ISSUE_MARKERS = (
+    "empty frame",
+    "missing column",
+    "null dates",
+    "null close",
+    "invalid close",
+    "invalid open",
+    "invalid high",
+    "invalid low",
+    "high < low",
+    "close outside high/low",
+    "duplicate dates remain",
+    "dates not sorted",
+    "fewer than",
+    "all bars dropped",
+)
+
+
+def _ok_from_ohlcv_issues(issues):
+    for item in issues or []:
+        text = str(item)
+        if any(marker in text for marker in _HARD_OHLCV_ISSUE_MARKERS):
+            return False
+    return True
+
+
 def _bucket_consistency_issues(df):
     if df is None or df.empty:
         return []
