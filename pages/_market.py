@@ -54,6 +54,8 @@ def _render_fund_bias_card(bias):
     view = bias_display(bias)
     st.markdown(f"#### {view['title']}")
     st.caption(view["disclaimer"] + "。本页不改交易评分。")
+    if view.get("legs_used"):
+        st.caption("所含维度：" + view["legs_used"])
     c1, c2 = st.columns(2)
     c1.metric("倾向", view["bias"])
     c2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
@@ -203,7 +205,7 @@ with tab3:
             enrich_sector_flow,
             extreme_rows,
             format_wan,
-            fund_flow_bias,
+            market_fund_bias,
             main_vs_retail,
             northbound_regime,
             rank_inflow,
@@ -225,7 +227,7 @@ with tab3:
 
         sector = enrich_sector_flow(sector, boards)
 
-        market_bias = fund_flow_bias(
+        market_bias = market_fund_bias(
             market_df=market_flow,
             north_df=north,
             sector_rank=sector,

@@ -269,7 +269,7 @@ class OptimizedTradingSignalAnalyzer:
         }
     
     def get_optimized_recommendation(self, fund_flow_bias=None):
-        """获取优化后的交易建议。fund_flow_bias 为可选资金面倾向，只做软评分。"""
+        """获取优化后的交易建议。fund_flow_bias 为可选资金面倾向，只做软参考，不改买卖动作。"""
         analysis = self.analyze_signals_with_weights()
         signals = analysis['signals']
         trend = analysis['trend_info']

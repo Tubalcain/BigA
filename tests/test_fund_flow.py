@@ -13,6 +13,8 @@ import pandas as pd
 from src.analysis.fund_flow import (
     actual_period_label,
     actual_sector_label,
+    MARKET_BIAS_LEGS,
+    STOCK_BIAS_LEGS,
     apply_fund_flow_bias,
     divergence_reading,
     enrich_sector_flow,
@@ -22,6 +24,7 @@ from src.analysis.fund_flow import (
     fund_flow_bias,
     latest_stock_snapshot,
     main_vs_retail,
+    market_fund_bias,
     northbound_regime,
     price_flow_divergence,
     rank_inflow,
@@ -29,6 +32,7 @@ from src.analysis.fund_flow import (
     scope_fallback_note,
     sector_rotation_stats,
     stock_flow_notes,
+    stock_fund_bias,
     summarize_rank,
     unit_caption,
     _divergence_conflicts,
@@ -485,13 +489,99 @@ class FlowBiasTests(unittest.TestCase):
         out = apply_fund_flow_bias(rec, bull, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5)
         self.assertEqual(out["score_raw"], 9)
         self.assertEqual(out["tech_score"], 9)
+        self.assertEqual(out["score"], 9)
         self.assertEqual(out["tech_confidence"], "中等")
         self.assertEqual(out["confidence"], "中等")
         self.assertGreater(out["fund_score_delta"], 0)
-        self.assertEqual(out["score"], 9 + out["fund_score_delta"])
-        self.assertEqual(out["recommendation"], "强烈买入")
+        self.assertEqual(out["blended_score"], 9 + out["fund_score_delta"])
+        self.assertEqual(out["action"], "BUY")
+        self.assertEqual(out["recommendation"], "买入")
         self.assertEqual(out["blended_confidence"], "高")
-        self.assertTrue(any("技术" in n and "资金" in n for n in out["analysis_notes"]))
+        self.assertTrue(any("不改买卖动作" in (out.get("reason") or "") or "主操作" in n for n in out["analysis_notes"]))
+
+    def test_apply_does_not_cross_action_threshold(self):
+        hold = {
+            "score": 4,
+            "recommendation": "持有",
+            "action": "HOLD",
+            "confidence": "中等",
+            "reason": "信号不明确",
+            "analysis_notes": [],
+        }
+        bull = {"score_delta": 2.0, "bias": "偏多", "horizon": "1-5日", "confidence_label": "中", "evidence": []}
+        out = apply_fund_flow_bias(hold, bull, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5)
+        self.assertEqual(out["action"], "HOLD")
+        self.assertEqual(out["recommendation"], "持有")
+        self.assertEqual(out["score"], 4)
+        self.assertEqual(out["tech_score"], 4)
+        self.assertEqual(out["fund_score_delta"], 2.0)
+        self.assertEqual(out["blended_score"], 6.0)
+        self.assertEqual(out["blended_action"], "BUY")
+        self.assertTrue(any("跨档" in n for n in out["analysis_notes"]))
+        buy = {
+            "score": 5,
+            "recommendation": "买入",
+            "action": "BUY",
+            "confidence": "中等",
+            "reason": "买入信号明显",
+            "analysis_notes": [],
+        }
+        bear = {"score_delta": -2.0, "bias": "偏空", "horizon": "1-5日", "confidence_label": "中", "evidence": []}
+        down = apply_fund_flow_bias(buy, bear, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5)
+        self.assertEqual(down["action"], "BUY")
+        self.assertEqual(down["recommendation"], "买入")
+        self.assertEqual(down["blended_score"], 3.0)
+        self.assertEqual(down["blended_action"], "HOLD")
+
+    def test_bad_stock_skips_divergence(self):
+        dates = pd.date_range("2024-01-01", periods=8, freq="D")
+        price = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
+        stock = pd.DataFrame({"date": dates, "main_net_inflow": [100, 80, -50, -80, -90, -100, -120, -150]})
+        stock.attrs["quality"] = {"ok": False}
+        stock.attrs["issues"] = ["duplicate dates remain"]
+        market = self._series([80, 90, 100, 110, 120, 130, 140, 150])
+        bias = fund_flow_bias(market_df=market, stock_flow=stock, price_df=price)
+        self.assertIn("stock", bias.get("dropped_legs") or [])
+        div = bias["components"].get("divergence") or {}
+        self.assertTrue(div.get("skipped"))
+        self.assertFalse(div.get("available"))
+        blob = " ".join(bias["evidence"])
+        self.assertNotIn("价涨资出", blob)
+        self.assertNotIn("追高风险", blob)
+        self.assertNotEqual(bias["bias"], "分化")
+        self.assertGreater(bias["score_delta"], 0)
+
+    def test_issues_without_ok_flag_still_drop_leg(self):
+        stock = self._series([20, 30, 40, 50, 60, 70])
+        stock.attrs["issues"] = ["dates not sorted"]
+        market = self._series([80, 90, 100, 110, 120, 130])
+        bias = fund_flow_bias(market_df=market, stock_flow=stock)
+        self.assertIn("stock", bias.get("dropped_legs") or [])
+        self.assertFalse(bias["components"]["stock"]["quality_ok"])
+        self.assertGreater(bias["score_delta"], 0)
+
+    def test_stock_bias_contract_matches_pages(self):
+        market = self._series([80, 90, 100, 110, 120, 130])
+        north = self._series([50, 60, 70, 80, 90, 100], col="net_inflow")
+        stock = self._series([20, 30, 40, 50, 60, 70])
+        dates = pd.date_range("2024-01-01", periods=6, freq="D")
+        price = pd.DataFrame({"date": dates, "close": [10, 10.1, 10.2, 10.3, 10.4, 10.5]})
+        analysis_page = stock_fund_bias(
+            stock_flow=stock, price_df=price, market_df=market, north_df=north
+        )
+        trading_page = stock_fund_bias(
+            stock_flow=stock, price_df=price, market_df=market, north_df=north
+        )
+        self.assertEqual(analysis_page["scope"], "stock")
+        self.assertEqual(trading_page["scope"], "stock")
+        self.assertEqual(analysis_page["legs_used"], STOCK_BIAS_LEGS)
+        self.assertEqual(analysis_page["bias"], trading_page["bias"])
+        self.assertEqual(analysis_page["score_delta"], trading_page["score_delta"])
+        self.assertEqual(analysis_page["confidence"], trading_page["confidence"])
+        market_page = market_fund_bias(market_df=market, north_df=north, sector_rank=None)
+        self.assertEqual(market_page["scope"], "market")
+        self.assertEqual(market_page["legs_used"], MARKET_BIAS_LEGS)
+        self.assertNotEqual(market_page["legs_used"], analysis_page["legs_used"])
 
 
 class FlowAdapterEmptyTests(unittest.TestCase):

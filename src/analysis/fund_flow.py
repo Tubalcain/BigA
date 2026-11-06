@@ -13,7 +13,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from src.data.quality import sector_type_short
+from src.data.quality import _ok_from_flow_issues, sector_type_short
 
 
 def format_wan(value, na="-"):
@@ -455,14 +455,8 @@ def enrich_sector_flow(flow, boards):
     return merged
 
 
-_SERIOUS_QUALITY_MARKERS = (
-    "empty frame",
-    "all-zero amounts",
-    "all null",
-    "missing column",
-    "missing inflow",
-    "unavailable",
-)
+# quality._ok_from_flow_issues 不含「源不可用」；分析层仍把这类 issues 当硬伤。
+_EXTRA_HARD_ISSUE_MARKERS = ("unavailable",)
 
 BIAS_BULL = "偏多"
 BIAS_BEAR = "偏空"
@@ -504,15 +498,37 @@ def _frame_has_rows(df):
     return df is not None and not getattr(df, "empty", True)
 
 
-def _frame_quality_ok(df):
-    """缺数据不算质量差；attrs.ok=False 或严重 issues 才判不合格。"""
-    if not _frame_has_rows(df):
-        return True
+def _collect_frame_issues(df):
+    issues = list(df.attrs.get("issues") or [])
+    nested = df.attrs.get("quality")
+    if isinstance(nested, dict):
+        for item in nested.get("issues") or []:
+            if item not in issues:
+                issues.append(item)
+    return issues
+
+
+def _frame_ok_flag(df):
     if df.attrs.get("ok") is False:
         return False
-    for item in df.attrs.get("issues") or []:
+    nested = df.attrs.get("quality")
+    if isinstance(nested, dict) and nested.get("ok") is False:
+        return False
+    return True
+
+
+def _frame_quality_ok(df):
+    """缺数据不算质量差。attrs.ok / attrs.quality.ok 为 False，或硬伤 issues，判不合格。"""
+    if not _frame_has_rows(df):
+        return True
+    if not _frame_ok_flag(df):
+        return False
+    issues = _collect_frame_issues(df)
+    if not _ok_from_flow_issues(issues):
+        return False
+    for item in issues:
         text = str(item)
-        if any(marker in text for marker in _SERIOUS_QUALITY_MARKERS):
+        if any(marker in text for marker in _EXTRA_HARD_ISSUE_MARKERS):
             return False
     return True
 
@@ -528,6 +544,8 @@ def empty_fund_bias(reason="资金数据不足，不下倾向"):
         "components": {},
         "quality_ok": True,
         "dropped_legs": [],
+        "scope": "",
+        "legs_used": "",
         "label": "资金面倾向（1–5日）",
         "disclaimer": "资金面倾向，不是涨跌预测",
     }
@@ -810,8 +828,10 @@ def fund_flow_bias(
             if sign:
                 votes.append(("sector", sign, 1.0))
 
+    stock_usable = False
     stock_streak = 0
     if _take("stock", stock_flow):
+        stock_usable = True
         snap = latest_stock_snapshot(stock_flow)
         col = _flow_value_col(stock_flow)
         accel = flow_acceleration(stock_flow, col=col)
@@ -835,27 +855,48 @@ def fund_flow_bias(
         if sign:
             votes.append(("stock", sign, 1.2))
 
-    div_note = latest_divergence_note(price_df, stock_flow) if price_df is not None else ""
-    reading = divergence_reading(div_note, streak=stock_streak or None)
+    price_usable = True
+    if _frame_has_rows(price_df) and not _frame_quality_ok(price_df):
+        price_usable = False
+        evidence.append("价格数据质量不足，价资背离不计入")
+    can_diverge = (
+        stock_usable
+        and price_usable
+        and _frame_has_rows(price_df)
+        and _frame_has_rows(stock_flow)
+    )
+    div_note = ""
+    reading = ""
     div_sign = 0
-    div_implied = _divergence_implied_sign(div_note)
-    if div_note == "价资同向（上涨）":
-        div_sign = 1
-    elif div_note == "价资同向（下跌）":
-        div_sign = -1
-    elif div_implied:
-        caution = True
-    if reading:
-        evidence.append(reading)
-    if price_df is not None or div_note:
+    div_implied = 0
+    if can_diverge:
+        div_note = latest_divergence_note(price_df, stock_flow)
+        reading = divergence_reading(div_note, streak=stock_streak or None)
+        div_implied = _divergence_implied_sign(div_note)
+        if div_note == "价资同向（上涨）":
+            div_sign = 1
+        elif div_note == "价资同向（下跌）":
+            div_sign = -1
+        elif div_implied:
+            caution = True
+        if reading:
+            evidence.append(reading)
         components["divergence"] = _leg_component(
             sign=div_sign or div_implied,
             available=bool(div_note),
+            quality_ok=True,
             note=div_note,
             reading=reading,
         )
         if div_sign:
             votes.append(("divergence", div_sign, 0.8))
+    elif price_df is not None or _frame_has_rows(stock_flow):
+        skip_reason = "stock quality" if not stock_usable else (
+            "price quality" if not price_usable else "missing"
+        )
+        components["divergence"] = _leg_component(
+            available=False, quality_ok=False, skipped=True, reason=skip_reason
+        )
 
     if not evidence:
         return result
@@ -870,7 +911,7 @@ def fund_flow_bias(
 
     bull = sum(1 for _, sign, _ in votes if sign > 0)
     bear = sum(1 for _, sign, _ in votes if sign < 0)
-    n_avail = sum(1 for item in components.values() if item.get("available") and item.get("quality_ok"))
+    n_avail = len({name for name, sign, _ in votes if sign})
     usable_votes = bull + bear
     weighted = sum(sign * weight for _, sign, weight in votes)
     # 有可用投票腿则整体仍可用于软评分；缺腿或坏腿不算全场不合格。
@@ -930,10 +971,42 @@ def bias_display(bias):
         "confidence_pct": f"{conf:.0%}",
         "score_delta": f"{float(payload.get('score_delta') or 0):+.1f}",
         "score_delta_label": "评分贡献",
+        "scope": payload.get("scope") or "",
+        "legs_used": payload.get("legs_used") or "",
         "evidence": list(payload.get("evidence") or []),
         "reading": ((payload.get("components") or {}).get("divergence") or {}).get("reading") or "",
         "horizon": payload.get("horizon") or BIAS_HORIZON,
     }
+
+
+MARKET_BIAS_LEGS = "市场主力 / 北向 / 行业榜"
+STOCK_BIAS_LEGS = "个股资金 / 价资 / 市场主力 / 北向"
+
+
+def market_fund_bias(market_df=None, north_df=None, sector_rank=None):
+    """市场级资金面倾向：大盘主力 + 北向 + 行业榜。不含个股。"""
+    result = fund_flow_bias(market_df=market_df, north_df=north_df, sector_rank=sector_rank)
+    result["scope"] = "market"
+    result["legs_used"] = MARKET_BIAS_LEGS
+    result["label"] = "资金面倾向（1–5日·市场级）"
+    return result
+
+
+def stock_fund_bias(stock_flow=None, price_df=None, market_df=None, north_df=None):
+    """
+    个股级资金面倾向。个股分析页与交易决策页必须走这里，输入维度一致：
+    个股资金流 + 价格 + 市场主力 + 北向。不含行业榜（行业轮动只在市场级）。
+    """
+    result = fund_flow_bias(
+        market_df=market_df,
+        north_df=north_df,
+        stock_flow=stock_flow,
+        price_df=price_df,
+    )
+    result["scope"] = "stock"
+    result["legs_used"] = STOCK_BIAS_LEGS
+    result["label"] = "资金面倾向（1–5日·个股级）"
+    return result
 
 
 def _action_from_score(score, strong_buy, buy, hold_floor, sell_floor):
@@ -950,40 +1023,43 @@ def _action_from_score(score, strong_buy, buy, hold_floor, sell_floor):
 
 def apply_fund_flow_bias(recommendation, bias=None, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5):
     """
-    把资金面 score_delta 软加到交易评分。信任 bias.score_delta（坏腿已在合成时剔除）。
-    保留技术信心 tech_confidence，不按总分阈值覆盖引擎原信心。
-    不改止损；若评分跨过阈值则同步更新 action。
+    真软参考：把资金面 score_delta 记到透明字段，不改写技术面 action / recommendation。
+    score 保持技术分，与主操作徽章一致；综合参考分在 blended_score。
     """
     rec = dict(recommendation or {})
     payload = bias or empty_fund_bias()
     raw = float(rec.get("score") or 0)
     delta = float(payload.get("score_delta") or 0)
+    blended = raw + delta
     rec["score_raw"] = raw
     rec["tech_score"] = raw
     rec["tech_confidence"] = rec.get("confidence")
     rec["fund_score_delta"] = delta
     rec["fund_flow_bias"] = payload
-    rec["score"] = raw + delta
+    rec["score"] = raw
+    rec["blended_score"] = blended
     notes = list(rec.get("analysis_notes") or [])
     notes.append(
         f"资金面倾向（{payload.get('horizon') or BIAS_HORIZON}）："
         f"{payload.get('bias') or BIAS_NEUTRAL}，"
         f"资金信心{payload.get('confidence_label') or '低'}，"
-        f"技术 {raw:+.1f} / 资金 {delta:+.1f}"
+        f"技术 {raw:+.1f} / 资金 {delta:+.1f} / 综合参考 {blended:+.1f}"
     )
     for line in payload.get("evidence") or []:
         notes.append(f"资金面：{line}")
-    rec["analysis_notes"] = notes
-    action, action_code, blended_conf = _action_from_score(
-        rec["score"], strong_buy, buy, hold_floor, sell_floor
+    _, blend_action, blended_conf = _action_from_score(
+        blended, strong_buy, buy, hold_floor, sell_floor
     )
-    rec["recommendation"] = action
-    rec["action"] = action_code
     rec["blended_confidence"] = blended_conf
+    rec["blended_action"] = blend_action
     rec["confidence"] = rec["tech_confidence"]
+    tech_action = rec.get("action")
+    if blend_action and tech_action and blend_action != tech_action:
+        notes.append("综合参考分跨档，资金面提示关注（主操作仍以技术面为准）")
+    rec["analysis_notes"] = notes
     if delta:
         reason = rec.get("reason") or ""
-        suffix = f"资金面软评分 {delta:+.1f}（倾向，非预测）"
+        suffix = f"资金面软评分 {delta:+.1f}（倾向，非预测，不改买卖动作）"
         rec["reason"] = f"{reason}；{suffix}" if reason else suffix
     return rec
 
@@ -1011,10 +1087,16 @@ class FundFlowAnalyzer:
         return stock_flow_notes(self.stock_df, self.north_df)
 
     def bias(self, price_df=None):
-        return fund_flow_bias(
+        price = price_df if price_df is not None else self.price_df
+        if self.stock_df is not None or price is not None:
+            return stock_fund_bias(
+                stock_flow=self.stock_df,
+                price_df=price,
+                market_df=self.market_df,
+                north_df=self.north_df,
+            )
+        return market_fund_bias(
             market_df=self.market_df,
             north_df=self.north_df,
             sector_rank=self.rank_df,
-            stock_flow=self.stock_df,
-            price_df=price_df if price_df is not None else self.price_df,
         )

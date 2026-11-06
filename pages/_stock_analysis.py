@@ -189,7 +189,7 @@ if analyze_btn or 'show_analysis' in st.session_state:
                 from src.analysis.fund_flow import (
                     bias_display,
                     format_wan,
-                    fund_flow_bias,
+                    stock_fund_bias,
                     latest_stock_snapshot,
                     main_vs_retail,
                     price_flow_divergence,
@@ -203,18 +203,21 @@ if analyze_btn or 'show_analysis' in st.session_state:
                         end_date.strftime("%Y%m%d"),
                     )
                     north = data_obj.get_northbound_flow()
-                stock_bias = fund_flow_bias(
-                    north_df=north,
+                    market_flow = data_obj.get_market_fund_flow()
+                stock_bias = stock_fund_bias(
                     stock_flow=stock_flow,
                     price_df=hist_data,
+                    market_df=market_flow,
+                    north_df=north,
                 )
                 view = bias_display(stock_bias)
                 st.markdown(f"**{view['title']}**")
-                st.caption(view["disclaimer"])
-                b1, b2, b3 = st.columns(3)
+                st.caption(view["disclaimer"] + "。本页不改交易评分。")
+                if view.get("legs_used"):
+                    st.caption("所含维度：" + view["legs_used"])
+                b1, b2 = st.columns(2)
                 b1.metric("倾向", view["bias"])
                 b2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
-                b3.metric("评分贡献", view["score_delta"])
                 for line in view["evidence"][:6]:
                     st.caption("· " + line)
                 if view["reading"]:

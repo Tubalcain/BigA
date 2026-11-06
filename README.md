@@ -33,7 +33,7 @@
 - 日期为 **Asia/Shanghai 日历日**（naive midnight）；`2024-1-2` / `2024/01/02` 会收成 `YYYYMMDD`；起止颠倒会**先交换再请求上游**，并标记 `date_range_swapped`。
 - 去重、丢弃缺 OHLC 的 bar、把 high/low 钳到包含 open/close，标记 `is_outlier`；页面会提示异常 K 线数量。
 - 空态可用 `describe_data_problems(df)` 收成一行给 UI；源切换用 `source_switch_note`。TTL 缓存只保存校验通过的历史 K 线；超时立刻返回，不等后台线程。
-- 资金流：东财排名按元、HSGT 历史按万、TuShare HSGT 按百万换算为万元；`auto` 只作兜底并做量级校验。周期/板块回退会写入 `actual_period` / `actual_sector` 和 `period_fallback:5日→今日` 这类 issues，UI 展示实际值。TuShare 行业/个股排名只有日频，多日请求会空表或回退 AKShare，不会盖请求周期的假章。概念/地域互相重叠，合计不当作全市场。分析在 `src/analysis/fund_flow.py`（排名、主力 vs 散户、趋势、价资背离、`fund_flow_bias` 短周期倾向）。倾向是 1–5 日方向，不是涨跌预测；坏腿只剔除该腿，没有可用投票腿或分化/中性时 `score_delta` 为 0。
+- 资金流：东财排名按元、HSGT 历史按万、TuShare HSGT 按百万换算为万元；`auto` 只作兜底并做量级校验。周期/板块回退会写入 `actual_period` / `actual_sector` 和 `period_fallback:5日→今日` 这类 issues，UI 展示实际值。TuShare 行业/个股排名只有日频，多日请求会空表或回退 AKShare，不会盖请求周期的假章。概念/地域互相重叠，合计不当作全市场。分析在 `src/analysis/fund_flow.py`（排名、主力 vs 散户、趋势、价资背离、`market_fund_bias` / `stock_fund_bias` 短周期倾向）。倾向是 1–5 日方向，不是涨跌预测。个股分析页与交易决策页共用个股级输入（个股资金、价资、市场主力、北向）。坏腿只剔除该腿；不合格个股表不算价资背离。`apply_fund_flow_bias` 只记软参考分，**不改**技术面买卖动作。
 - TuShare 行业与大盘资金接口（`moneyflow_ind_dc` / `moneyflow_mkt_dc`）需要积分，没有权限时回退 AKShare，不会假装有数据。OpenBB 未接入。
 
 ## 快速开始

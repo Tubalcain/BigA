@@ -236,7 +236,7 @@ class TradingSignalAnalyzer:
         }
     
     def get_trading_recommendation(self, fund_flow_bias=None):
-        """综合交易建议。fund_flow_bias 为可选资金面倾向，只做软评分。"""
+        """综合交易建议。fund_flow_bias 为可选资金面倾向，只做软参考，不改买卖动作。"""
         # 分析技术信号
         signals = self.analyze_technical_signals()
         
