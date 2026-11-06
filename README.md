@@ -88,6 +88,27 @@ python -m unittest tests.test_data_quality
 python examples/test_data_source.py
 ```
 
+### 5. 导出 Saima 资金流快照
+
+把市场级 `market_fund_bias`（大盘主力 / 北向 / 行业板块榜）写成 JSON，供外部治理仓落盘到 `/workspace/Saima/inbox/biga/YYYY-MM-DD.json`。单腿超时或无 Token 会降级，三腿全挂也输出合法快照（`bias=中性`、`quality_ok=false`、`score_delta=0`）。不在目标目录执行 git。
+
+```bash
+python -m src.cli.export_saima_snapshot --date 2026-11-06 --inbox-dir /workspace/Saima/inbox/biga
+python -m src.cli.export_saima_snapshot --output /tmp/2026-11-06.json
+```
+
+`--date` 默认取 Asia/Shanghai 当日。成功时 stdout 一行：
+
+```
+BigA fund_flow 2026-11-06 archived bias=偏多 quality_ok=true path=/workspace/Saima/inbox/biga/2026-11-06.json
+```
+
+离线单测：
+
+```bash
+python -m unittest tests.test_saima_export
+```
+
 ## 使用指南
 
 - **交易决策**：买卖信号、止损止盈、仓位；K 线周期（日/周/月）会传给数据层
@@ -114,7 +135,8 @@ bigA/
 │   │   ├── cache.py / fetch.py    # TTL 缓存、超时重试
 │   │   ├── akshare_data.py
 │   │   └── tushare_data.py
-│   ├── analysis/                 # 技术指标 + 资金流分析
+│   ├── analysis/                 # 技术指标 + 资金流分析 + Saima 快照
+│   ├── cli/                      # python -m src.cli.export_saima_snapshot
 │   ├── visualization/
 │   └── utils/
 ├── pages/
@@ -127,6 +149,7 @@ bigA/
 ├── examples/test_data_source.py
 ├── tests/test_data_quality.py
 ├── tests/test_fund_flow.py
+├── tests/test_saima_export.py
 └── data/                          # 本地缓存目录（gitignored）
 ```
 
