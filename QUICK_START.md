@@ -99,13 +99,22 @@ export TUSHARE_TOKEN=your_token_here
 3. 查看收益分析
 4. 导出报告
 
+### 4. 看资金流向
+1. 打开「市场分析」→「资金流向」
+2. 切换 今日 / 3日 / 5日 / 10日 与行业/概念/地域
+3. 先看顶部「资金面倾向（1–5日）」：偏多/偏空/中性/分化，不是涨跌预测
+4. 再看流入/流出榜、主力 vs 小单、北向趋势（金额单位：万元）
+5. 「股票分析」与「交易决策」对同一只股票用同一套个股级资金面输入（个股 + 价资 + 市场主力 + 北向）；分析页不改交易评分
+6. 「交易决策」拆开展示技术评分 / 资金软分 / 综合参考分；软分不改买卖动作。坏腿只剔除该腿，分化或无可用腿时软分为 0
+7. 「股票筛选」可叠加排名；「该周期净流入>0」用排名接口，不逐股拉历史
+
 ## 测试数据源
 
 运行测试脚本检查数据源是否正常：
 
 ```bash
-# 离线：schema / 缓存 / 配置
-python -m unittest tests.test_data_quality
+# 离线：schema / 缓存 / 配置 / 资金流分析
+python -m unittest tests.test_data_quality tests.test_fund_flow
 
 # 在线冒烟：AKShare 必测，TuShare 无 token 则跳过
 python examples/test_data_source.py

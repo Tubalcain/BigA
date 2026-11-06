@@ -148,15 +148,42 @@ if analyze_btn or 'analyze' in st.session_state:
             
             # 选择分析引擎
             use_optimized = '优化版' in analysis_mode
+
+            from src.analysis.fund_flow import (
+                bias_display,
+                format_wan,
+                stock_fund_bias,
+                northbound_regime,
+                stock_flow_notes,
+            )
+            from src.data import describe_data_problems
+
+            end_key = end_date.strftime("%Y%m%d")
+            start_key = start_date.strftime("%Y%m%d")
+            flow_exc = None
+            try:
+                stock_flow = ak_data.get_stock_fund_flow(stock_code, start_key, end_key)
+                north = ak_data.get_northbound_flow()
+                market_flow = ak_data.get_market_fund_flow()
+            except Exception as exc:
+                flow_exc = exc
+                stock_flow, north, market_flow = None, None, None
+
+            flow_bias = stock_fund_bias(
+                stock_flow=stock_flow,
+                price_df=hist_data,
+                market_df=market_flow,
+                north_df=north,
+            )
             
             if use_optimized:
                 # 使用优化版分析引擎
                 signal_analyzer = OptimizedTradingSignalAnalyzer(hist_data)
-                recommendation = signal_analyzer.get_optimized_recommendation()
+                recommendation = signal_analyzer.get_optimized_recommendation(fund_flow_bias=flow_bias)
             else:
                 # 使用原版分析引擎
                 signal_analyzer = TradingSignalAnalyzer(hist_data)
-                recommendation = signal_analyzer.get_trading_recommendation()
+                recommendation = signal_analyzer.get_trading_recommendation(fund_flow_bias=flow_bias)
             
             # 高级分析
             advanced_analyzer = AdvancedTradingAnalyzer(hist_data, stock_code)
@@ -187,7 +214,7 @@ if analyze_btn or 'analyze' in st.session_state:
             else:
                 st.subheader("💡 核心交易建议")
             
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
             
             with col1:
                 action = recommendation['action']
@@ -198,24 +225,65 @@ if analyze_btn or 'analyze' in st.session_state:
                 else:
                     st.metric("推荐动作", "🟡 持有", delta="中性信号")
             
+            tech_score = recommendation.get("tech_score", recommendation.get("score_raw", recommendation["score"]))
+            fund_delta = recommendation.get("fund_score_delta", 0)
+            blended = recommendation.get("blended_score", float(tech_score) + float(fund_delta))
             with col2:
-                score = recommendation['score']
-                st.metric("综合评分", f"{score:.1f}", delta=f"{'+' if score >= 0 else ''}{score:.1f}分")
-            
+                st.metric("技术评分", f"{float(tech_score):.1f}")
             with col3:
-                confidence = recommendation['confidence']
-                st.metric("信心度", confidence)
-            
+                st.metric("资金软分", f"{float(fund_delta):+.1f}")
             with col4:
-                momentum_pct = momentum['percentage']
-                st.metric("动量得分", f"{momentum['score']}/15", 
-                         delta=f"{momentum_pct:.1f}%")
-            
+                st.metric("综合参考分", f"{float(blended):.1f}")
             with col5:
+                tech_conf = recommendation.get("tech_confidence", recommendation.get("confidence"))
+                st.metric("技术信心", tech_conf or "-")
+            with col6:
                 trend = trading_plan['trend']
                 st.metric("趋势状态", trend)
+            st.caption(
+                f"动量 {momentum['score']}/15（{momentum['percentage']:.1f}%）。"
+                f"主操作按技术面；综合参考分 = 技术 {float(tech_score):.1f} + 资金 {float(fund_delta):+.1f}，不改买卖动作。"
+            )
+            if recommendation.get("blended_action") and recommendation.get("blended_action") != recommendation.get("action"):
+                st.caption("综合参考分跨档，资金面提示关注（主操作仍以技术面为准）。")
+
+            view = bias_display(flow_bias)
+            st.markdown(f"##### {view['title']}")
+            st.caption(view["disclaimer"])
+            if view.get("legs_used"):
+                st.caption("所含维度：" + view["legs_used"] + "（与股票分析页相同）")
+            bc1, bc2, bc3 = st.columns(3)
+            bc1.metric("倾向", view["bias"])
+            bc2.metric("资金信心", view["confidence_label"], delta=view["confidence_pct"])
+            bc3.metric("资金软分", view["score_delta"])
+            for line in view["evidence"][:6]:
+                st.caption("· " + line)
+
+            notes = stock_flow_notes(stock_flow, north)
+            st.markdown("##### 资金面")
+            if flow_exc is not None:
+                st.caption(f"资金面暂不可用: {flow_exc}")
+            elif stock_flow is not None and not stock_flow.empty and "main_net_inflow" in stock_flow.columns:
+                latest_main = stock_flow["main_net_inflow"].iloc[-1]
+                sum_5 = pd.to_numeric(stock_flow["main_net_inflow"].tail(5), errors="coerce").sum()
+                fc1, fc2, fc3 = st.columns(3)
+                fc1.metric("主力净流入", format_wan(latest_main))
+                fc2.metric("近5日主力", format_wan(sum_5))
+                regime = northbound_regime(north) if north is not None else {}
+                fc3.metric("北向5日", format_wan(regime.get("window_sum")))
+                if notes:
+                    st.caption("；".join(notes))
+            else:
+                st.info("个股资金序列暂不可用。")
+                reason = describe_data_problems(stock_flow)
+                if reason:
+                    st.caption(reason)
+                if north is not None and not north.empty:
+                    regime = northbound_regime(north)
+                    st.caption(regime.get("note") or "")
             
             # 2. 止损止盈建议
+            stop_loss_data = {}
             if show_stop_loss:
                 st.markdown("---")
                 st.subheader("🛡️ 止损止盈建议")
@@ -249,13 +317,19 @@ if analyze_btn or 'analyze' in st.session_state:
                     stop_loss_val = stop_loss_data.get('stop_loss', 0)
                     col2.metric("止损位", f"{stop_loss_val:.2f}")
                 
-                if 'take_profit' in stop_loss_data:
-                    col3.metric("止盈位1", f"{stop_loss_data['take_profit']['level_1']:.2f}",
-                               delta=f"+{stop_loss_data['take_profit']['distance_pct_1']:.2f}%")
-                    col4.metric("支撑位", f"{stop_loss_data['support']:.2f}")
+                tp = stop_loss_data.get("take_profit") or {}
+                tp_level = tp.get("level_1")
+                tp_pct = tp.get("distance_pct_1")
+                if tp_level is not None:
+                    col3.metric(
+                        "止盈位1",
+                        f"{tp_level:.2f}",
+                        delta=f"+{tp_pct:.2f}%" if tp_pct is not None else None,
+                    )
                 else:
                     col3.metric("止盈位", "计算中")
-                    col4.metric("支撑位", "-")
+                support = stop_loss_data.get("support")
+                col4.metric("支撑位", f"{support:.2f}" if support not in (None, 0) else "-")
             
             # 3. 仓位管理建议
             st.markdown("---")
@@ -434,7 +508,8 @@ if analyze_btn or 'analyze' in st.session_state:
                     st.markdown(f"**趋势方向**：{trend}")
                     st.markdown(f"**动量得分**：{momentum['score']}/15 ({momentum['percentage']:.1f}%)")
                     st.markdown(f"**信心度**：{recommendation['confidence']}")
-                    st.markdown(f"**综合评分**：{recommendation['score']}分")
+                    st.markdown(f"**技术评分**：{recommendation.get('tech_score', recommendation.get('score'))}分")
+                    st.markdown(f"**综合参考分**：{recommendation.get('blended_score', recommendation.get('score'))}分")
                 
                 with col2:
                     st.markdown("### 仓位建议")
@@ -444,13 +519,27 @@ if analyze_btn or 'analyze' in st.session_state:
                     st.markdown(f"**止损比例**：{position['stop_loss_pct']:.2f}%")
                     st.markdown(f"**风险金额**：¥{position['risk_amount']:,.0f}")
             
+            sl = (stop_loss_data or {}).get("stop_loss") or {}
+            sl_long = sl.get("long") if isinstance(sl, dict) else sl
+            sl_pct = sl.get("distance_pct") if isinstance(sl, dict) else None
+            tp = (stop_loss_data or {}).get("take_profit") or {}
+            sl_txt = (
+                f"{sl_long:.2f}（跌幅{sl_pct:.2f}%）"
+                if isinstance(sl_long, (int, float)) and sl_pct is not None
+                else ("暂无" if sl_long in (None, 0) else str(sl_long))
+            )
+            tp_txt = (
+                f"{tp.get('level_1'):.2f}（涨幅{tp.get('distance_pct_1', 0):.2f}%）"
+                if tp.get("level_1") is not None
+                else "暂无"
+            )
             st.info(f"""
             **根据您的风险偏好（{risk_tolerance}）的建议**：
             
             1. **操作方向**：{recommendation['recommendation']}
             2. **建议仓位**：{position['position_pct']:.1f}%（{position['suggested_shares']}股）
-            3. **止损位**：{stop_loss_data['stop_loss']['long']:.2f}（跌幅{stop_loss_data['stop_loss']['distance_pct']:.2f}%）
-            4. **止盈位**：{stop_loss_data['take_profit']['level_1']:.2f}（涨幅{stop_loss_data['take_profit']['distance_pct_1']:.2f}%）
+            3. **止损位**：{sl_txt}
+            4. **止盈位**：{tp_txt}
             
             **重要提醒**：
             - 本分析仅供参考，不构成投资建议

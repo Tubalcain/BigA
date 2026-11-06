@@ -41,6 +41,36 @@ def _empty_reason(frame, fallback=""):
     return fallback
 
 
+def _show_empty(frame, fallback="接口暂时不可用（源站限流、字段变更或权限不足时会自动降级）。"):
+    st.info(fallback)
+    reason = _empty_reason(frame)
+    if reason:
+        st.caption(reason)
+
+
+def _render_fund_bias_card(bias):
+    from src.analysis.fund_flow import bias_display
+
+    view = bias_display(bias)
+    st.markdown(f"#### {view['title']}")
+    st.caption(view["disclaimer"] + "。本页不改交易评分。")
+    if view.get("legs_used"):
+        st.caption("所含维度：" + view["legs_used"])
+    c1, c2 = st.columns(2)
+    c1.metric("倾向", view["bias"])
+    c2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
+    for line in view["evidence"][:8]:
+        st.caption("· " + line)
+
+
+def _flow_table(df, extra=None, rows=20):
+    cols = ["code", "name", "net_inflow", "main_net_inflow", "super_large_net", "large_net", "small_net", "change_pct"]
+    if extra:
+        cols.extend(extra)
+    show = [c for c in cols if c in df.columns]
+    st.dataframe(df[show].head(rows) if show else df.head(rows), use_container_width=True, hide_index=True)
+
+
 def _index_metric(column, indices, keyword, label):
     if indices is None or indices.empty or "name" not in indices.columns:
         column.metric(label, "-")
@@ -158,27 +188,151 @@ with tab2:
 
 with tab3:
     st.subheader("💰 资金流向")
+    st.caption("金额已统一为万元。主力 ≈ 超大单 + 大单；小单近似散户。顶部「资金面倾向」是 1–5 日方向，不是涨跌预测。源站限流或积分不足时会空表降级并标明原因。")
+
+    ctrl1, ctrl2, ctrl3 = st.columns(3)
+    with ctrl1:
+        period = st.selectbox("统计周期", ["今日", "3日", "5日", "10日"], index=0)
+    with ctrl2:
+        sector_kind = st.selectbox("板块类型", ["行业", "概念", "地域"], index=0)
+    with ctrl3:
+        rank_n = st.slider("榜单条数", min_value=8, max_value=30, value=15, step=1)
 
     try:
+        from src.analysis.fund_flow import (
+            actual_period_label,
+            actual_sector_label,
+            enrich_sector_flow,
+            extreme_rows,
+            format_wan,
+            market_fund_bias,
+            main_vs_retail,
+            northbound_regime,
+            rank_inflow,
+            rank_outflow,
+            scope_fallback_note,
+            unit_caption,
+        )
+        from src.visualization.charts import PlotlyChartGenerator
+
         ak_data = _load_client()
+        chart_gen = PlotlyChartGenerator()
 
         with st.spinner("正在获取资金流向..."):
-            flow = ak_data.get_fund_flow()
+            sector = ak_data.get_sector_fund_flow(indicator=period, sector_type=sector_kind)
+            stock_rank = ak_data.get_stock_fund_flow_rank(indicator=period)
+            market_flow = ak_data.get_market_fund_flow()
             north = ak_data.get_northbound_flow()
+            boards = ak_data.get_industry_boards()
 
-        if flow is not None and not flow.empty:
-            show_cols = [c for c in ["name", "net_inflow", "change_pct"] if c in flow.columns]
-            st.dataframe(flow[show_cols].head(30) if show_cols else flow.head(30), use_container_width=True)
-            st.caption(f"数据来源: {flow.attrs.get('source', 'akshare')} | 净流入单位视上游接口而定")
+        sector = enrich_sector_flow(sector, boards)
+
+        market_bias = market_fund_bias(
+            market_df=market_flow,
+            north_df=north,
+            sector_rank=sector,
+        )
+        _render_fund_bias_card(market_bias)
+        st.markdown("---")
+
+        st.markdown("#### 市场资金")
+        if market_flow is not None and not market_flow.empty and "main_net_inflow" in market_flow.columns:
+            last = market_flow.iloc[-1]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("主力净流入", format_wan(last.get("main_net_inflow")))
+            m2.metric("超大单", format_wan(last.get("super_large_net")))
+            m3.metric("大单", format_wan(last.get("large_net")))
+            m4.metric("小单(散户)", format_wan(last.get("small_net")))
+            y_cols = [c for c in ["main_net_inflow", "super_large_net", "small_net"] if c in market_flow.columns]
+            fig_mkt = chart_gen.line_chart(market_flow.tail(60), "date", y_cols, title="市场主力资金（近60日）")
+            st.plotly_chart(fig_mkt, use_container_width=True)
+            st.caption(unit_caption(market_flow))
         else:
-            st.info("资金流向接口暂时不可用（源站限流或字段变更时会自动降级）。")
-            reason = _empty_reason(flow)
-            if reason:
-                st.caption(reason)
+            _show_empty(market_flow, "市场级资金序列暂时不可用，不使用板块加总冒充全市场。")
 
-        if north is not None and not north.empty:
-            st.markdown("#### 北向资金")
-            st.dataframe(north.tail(10), use_container_width=True)
+        actual_sector = actual_sector_label(sector, sector_kind)
+        actual_period = actual_period_label(sector, period)
+        fallback_note = scope_fallback_note(sector, requested_period=period, requested_sector=sector_kind)
+        if fallback_note:
+            st.warning(fallback_note)
+
+        st.markdown("---")
+        st.markdown(f"#### {actual_sector or sector_kind}资金排名（{actual_period or period}）")
+        if sector is not None and not sector.empty and "net_inflow" in sector.columns:
+            vs = main_vs_retail(sector)
+            c1, c2, c3 = st.columns(3)
+            if vs.get("overlapping"):
+                c1.metric("榜内主力合计", format_wan(vs.get("main_net_inflow")))
+                c2.metric("榜内小单合计", format_wan(vs.get("retail_net_inflow")))
+            else:
+                c1.metric("主力合计", format_wan(vs.get("main_net_inflow")))
+                c2.metric("小单合计", format_wan(vs.get("retail_net_inflow")))
+            c3.caption(vs.get("note") or "")
+            chart_df = extreme_rows(sector, n=rank_n)
+            label = "name" if "name" in chart_df.columns else "code"
+            fig = chart_gen.signed_bar_chart(
+                chart_df, label, "net_inflow", title=f"{actual_sector or sector_kind}净流入 / 净流出（{actual_period or period}）"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            left, right = st.columns(2)
+            with left:
+                st.markdown("**流入榜**")
+                _flow_table(rank_inflow(sector, n=rank_n))
+            with right:
+                st.markdown("**流出榜**")
+                _flow_table(rank_outflow(sector, n=rank_n))
+            st.caption(unit_caption(sector, requested_period=period, requested_sector=sector_kind))
+        else:
+            _show_empty(sector, "板块资金流向暂时不可用。")
+
+        stock_period = actual_period_label(stock_rank, period)
+        stock_fallback = scope_fallback_note(stock_rank, requested_period=period)
+        if stock_fallback:
+            st.caption(stock_fallback)
+        st.markdown("---")
+        st.markdown(f"#### 个股主力排名（{stock_period or period}）")
+        if stock_rank is not None and not stock_rank.empty and "net_inflow" in stock_rank.columns:
+            chart_df = extreme_rows(stock_rank, n=rank_n)
+            label = "name" if "name" in chart_df.columns else "code"
+            fig = chart_gen.signed_bar_chart(
+                chart_df, label, "net_inflow", title="个股主力净流入 / 净流出"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            left, right = st.columns(2)
+            with left:
+                st.markdown("**流入榜**")
+                _flow_table(rank_inflow(stock_rank, n=rank_n))
+            with right:
+                st.markdown("**流出榜**")
+                _flow_table(rank_outflow(stock_rank, n=rank_n))
+            st.caption(unit_caption(stock_rank, requested_period=period))
+        else:
+            _show_empty(stock_rank, "个股资金排名暂时不可用。")
+
+        st.markdown("---")
+        st.markdown("#### 北向 / 南向资金")
+        if north is not None and not north.empty and "net_inflow" in north.columns:
+            regime = northbound_regime(north)
+            n1, n2, n3 = st.columns(3)
+            n1.metric("最新北向", format_wan(regime.get("latest")))
+            n2.metric("近5日合计", format_wan(regime.get("window_sum")))
+            n3.metric("状态", {"inflow": "净流入", "outflow": "净流出", "mixed": "分化"}.get(regime.get("regime"), "未知"))
+            st.caption(regime.get("note") or "")
+            y_cols = [
+                c
+                for c in ["north_inflow", "south_inflow", "net_inflow"]
+                if c in north.columns and north[c].notna().any()
+            ]
+            # 避免 north_inflow 与 net_inflow 重复画一条线
+            if "north_inflow" in y_cols and "net_inflow" in y_cols:
+                y_cols = [c for c in y_cols if c != "net_inflow"]
+            fig_n = chart_gen.line_chart(north.tail(90), "date", y_cols, title="北向 / 南向净流入（近90日）")
+            st.plotly_chart(fig_n, use_container_width=True)
+            show_cols = [c for c in ["date", "north_inflow", "south_inflow", "net_inflow", "hgt", "sgt"] if c in north.columns]
+            st.dataframe(north[show_cols].tail(12) if show_cols else north.tail(12), use_container_width=True, hide_index=True)
+            st.caption(unit_caption(north))
+        else:
+            _show_empty(north, "北向资金暂时不可用。")
 
     except Exception as e:
         st.error(f"获取资金流向时发生错误: {str(e)}")

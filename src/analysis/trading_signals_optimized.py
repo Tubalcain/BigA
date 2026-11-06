@@ -268,8 +268,8 @@ class OptimizedTradingSignalAnalyzer:
             }
         }
     
-    def get_optimized_recommendation(self):
-        """获取优化后的交易建议"""
+    def get_optimized_recommendation(self, fund_flow_bias=None):
+        """获取优化后的交易建议。fund_flow_bias 为可选资金面倾向，只做软参考，不改买卖动作。"""
         analysis = self.analyze_signals_with_weights()
         signals = analysis['signals']
         trend = analysis['trend_info']
@@ -314,7 +314,7 @@ class OptimizedTradingSignalAnalyzer:
             confidence = '高'
             reason = '多个强卖出信号，建议及时止损'
         
-        return {
+        rec = {
             'recommendation': recommendation,
             'action': action,
             'confidence': confidence,
@@ -329,6 +329,13 @@ class OptimizedTradingSignalAnalyzer:
             'vol_info': vol,
             'analysis_notes': self._generate_analysis_notes(score, trend, position, vol)
         }
+        if fund_flow_bias is not None:
+            from src.analysis.fund_flow import apply_fund_flow_bias
+
+            rec = apply_fund_flow_bias(
+                rec, fund_flow_bias, strong_buy=10, buy=5, hold_floor=0, sell_floor=-5
+            )
+        return rec
     
     def _generate_analysis_notes(self, score, trend, position, vol):
         """生成分析说明"""
