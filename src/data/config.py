@@ -70,6 +70,7 @@ class SourceConfig:
     base_url: str = ""
     timeout: int = 30
     retries: int = 3
+    retry_budget: int = 45
     adjust: str = ""
 
 
@@ -80,6 +81,9 @@ class CacheConfig:
     ttl_realtime: int = 30
     ttl_list: int = 3600
     ttl_calendar: int = 86400
+    ttl_failure: int = 45
+    ttl_success_max: int = 3600
+    persist: bool = True
     max_size: int = 1000
     directory: str = "data/cache"
 
@@ -104,6 +108,7 @@ def _source_from_yaml(name, raw, defaults):
         base_url=str(raw.get("base_url") or defaults.base_url or ""),
         timeout=_as_int(raw.get("timeout"), defaults.timeout),
         retries=_as_int(raw.get("retries"), defaults.retries),
+        retry_budget=_as_int(raw.get("retry_budget"), defaults.retry_budget),
         adjust=str(raw.get("adjust") if raw.get("adjust") is not None else defaults.adjust),
     )
 
@@ -116,6 +121,9 @@ def _cache_from_yaml(raw, defaults):
         ttl_realtime=_as_int(raw.get("ttl_realtime"), defaults.ttl_realtime),
         ttl_list=_as_int(raw.get("ttl_list"), defaults.ttl_list),
         ttl_calendar=_as_int(raw.get("ttl_calendar"), defaults.ttl_calendar),
+        ttl_failure=_as_int(raw.get("ttl_failure"), defaults.ttl_failure),
+        ttl_success_max=_as_int(raw.get("ttl_success_max"), defaults.ttl_success_max),
+        persist=_as_bool(raw.get("persist"), defaults.persist),
         max_size=_as_int(raw.get("max_size"), defaults.max_size),
         directory=str(raw.get("directory") or defaults.directory),
     )
@@ -149,6 +157,14 @@ def _apply_env(cfg: DataConfig) -> DataConfig:
     cache_enabled = os.getenv("BIGA_CACHE_ENABLED")
     if cache_enabled is not None:
         cfg.cache.enabled = _as_bool(cache_enabled, cfg.cache.enabled)
+
+    cache_persist = os.getenv("BIGA_CACHE_PERSIST")
+    if cache_persist is not None:
+        cfg.cache.persist = _as_bool(cache_persist, cfg.cache.persist)
+
+    cache_dir_env = os.getenv("BIGA_CACHE_DIR")
+    if cache_dir_env:
+        cfg.cache.directory = cache_dir_env.strip()
 
     return cfg
 

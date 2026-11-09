@@ -16,6 +16,7 @@ from src.analysis.fund_flow import (
     MARKET_BIAS_LEGS,
     STOCK_BIAS_LEGS,
     apply_fund_flow_bias,
+    bias_display,
     divergence_reading,
     frame_quality_ok,
     enrich_sector_flow,
@@ -440,6 +441,7 @@ class FlowBiasTests(unittest.TestCase):
         self.assertEqual(bias["bias"], "中性")
         self.assertEqual(bias["score_delta"], 0)
         self.assertEqual(bias["confidence"], 0)
+        self.assertFalse(bias["quality_ok"])
 
     def test_acceleration_and_divergence_reading(self):
         accel_in = flow_acceleration(self._series([10, 10, 10, 10, 10, 80, 90, 100, 110, 120]), window=5)
@@ -625,6 +627,42 @@ class FlowBiasTests(unittest.TestCase):
         price2.attrs["issues"] = ["null close", "fewer than 60 bars"]
         self.assertFalse(frame_quality_ok(price2))
 
+    def test_market_only_zero_north_is_insufficient(self):
+        north = self._series([0, 0, 0, 0, 0, 0], col="net_inflow")
+        bias = market_fund_bias(market_df=None, north_df=north, sector_rank=None)
+        self.assertEqual(bias["bias"], "中性")
+        self.assertFalse(bias["quality_ok"])
+        self.assertTrue(bias.get("insufficient"))
+        self.assertEqual(bias["confidence"], 0)
+        self.assertEqual(bias["score_delta"], 0)
+        self.assertEqual(bias["components"]["north"]["data_date"], "2024-01-06")
+        view = bias_display(bias)
+        self.assertFalse(view["quality_ok"])
+        self.assertTrue(view["insufficient"])
+        self.assertTrue(any("2024-01-06" in line for line in view["leg_date_captions"]))
+
+    def test_valid_primary_neutral_is_not_insufficient(self):
+        market = self._series([1, -1, 1, -1, 1, 0])
+        bias = market_fund_bias(market_df=market, north_df=None, sector_rank=None)
+        self.assertEqual(bias["bias"], "中性")
+        self.assertTrue(bias["quality_ok"])
+        self.assertFalse(bias.get("insufficient"))
+        self.assertEqual(bias["score_delta"], 0)
+        self.assertTrue(bias["components"]["market"]["available"])
+        self.assertEqual(bias["components"]["market"]["data_date"], "2024-01-06")
+
+    def test_market_bad_leg_keeps_industry_primary(self):
+        market = self._series([80, 90, 100, 110, 120, 130])
+        market.attrs["ok"] = False
+        market.attrs["issues"] = ["all-zero amounts"]
+        industry = pd.DataFrame({"name": ["银行", "半导体", "煤炭"], "net_inflow": [800, 600, -50]})
+        industry.attrs["actual_sector"] = "行业资金流"
+        bias = market_fund_bias(market_df=market, sector_rank=industry)
+        self.assertIn("market", bias.get("dropped_legs") or [])
+        self.assertTrue(bias["quality_ok"])
+        self.assertEqual(bias["bias"], "偏多")
+        self.assertGreater(bias["score_delta"], 0)
+
 
 class FlowAdapterEmptyTests(unittest.TestCase):
     def test_disabled_akshare_flow_methods(self):
@@ -683,8 +721,10 @@ class FlowAdapterEmptyTests(unittest.TestCase):
 
     def test_akshare_sector_fallback_stamps_actual_scope(self):
         from src.data.akshare_data import AKShareData
+        from src.data.cache import reset_cache
         from src.data.config import get_data_config
 
+        reset_cache()
         cfg = get_data_config(reload=True)
         client = AKShareData(cfg)
         client.is_available = lambda: True

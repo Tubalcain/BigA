@@ -13,6 +13,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from src.data.calendar import expected_daily_data_date, format_leg_date_caption
 from src.data.quality import _ok_from_flow_issues, _ok_from_ohlcv_issues, sector_type_short
 
 
@@ -498,6 +499,52 @@ def _frame_has_rows(df):
     return df is not None and not getattr(df, "empty", True)
 
 
+def _frame_data_date(df):
+    """腿上真实数据日期（日历日），不是 snapshot as_of_date。"""
+    if df is None or getattr(df, "empty", True):
+        return None
+    if "date" not in getattr(df, "columns", []):
+        return None
+    series = pd.to_datetime(df["date"], errors="coerce")
+    if not series.notna().any():
+        return None
+    stamp = series.max()
+    if getattr(stamp, "tzinfo", None) is not None:
+        try:
+            stamp = stamp.tz_convert("Asia/Shanghai")
+        except (TypeError, AttributeError):
+            stamp = stamp.tz_localize(None)
+    return pd.Timestamp(stamp).strftime("%Y-%m-%d")
+
+
+def market_primary_sufficient(components):
+    """
+    市场级足够有效主数据：至少一条可用的大盘主力，或可用且非重叠的行业榜。
+    北向是辅助腿，单独零信息/无方向不能撑起 quality_ok。
+    """
+    components = components or {}
+    market = components.get("market") or {}
+    if market.get("available") and market.get("quality_ok", True):
+        return True
+    sector = components.get("sector") or {}
+    if (
+        sector.get("available")
+        and sector.get("quality_ok", True)
+        and not sector.get("overlapping")
+        and sector.get("usable_for_rotation") is not False
+    ):
+        return True
+    return False
+
+
+def attach_leg_dates(components, frames):
+    for name, df in frames:
+        if name not in components:
+            continue
+        components[name].setdefault("data_date", _frame_data_date(df))
+    return components
+
+
 def _collect_frame_issues(df):
     issues = list(df.attrs.get("issues") or [])
     nested = df.attrs.get("quality")
@@ -547,12 +594,13 @@ def empty_fund_bias(reason="资金数据不足，不下倾向"):
         "evidence": [reason] if reason else [],
         "score_delta": 0.0,
         "components": {},
-        "quality_ok": True,
+        "quality_ok": False,
         "dropped_legs": [],
         "scope": "",
         "legs_used": "",
         "label": "资金面倾向（1–5日）",
         "disclaimer": "资金面倾向，不是涨跌预测",
+        "insufficient": True,
     }
 
 
@@ -903,7 +951,19 @@ def fund_flow_bias(
             available=False, quality_ok=False, skipped=True, reason=skip_reason
         )
 
+    attach_leg_dates(
+        components,
+        (
+            ("market", market_df),
+            ("north", north_df),
+            ("sector", sector_rank),
+            ("stock", stock_flow),
+        ),
+    )
+
     if not evidence:
+        result["components"] = components
+        result["dropped_legs"] = list(dropped_legs)
         return result
 
     stock_sign = int((components.get("stock") or {}).get("sign") or 0)
@@ -959,6 +1019,7 @@ def fund_flow_bias(
             "quality_ok": quality_ok,
             "dropped_legs": list(dropped_legs),
             "net_vote": float(weighted),
+            "insufficient": not quality_ok,
         }
     )
     return result
@@ -968,6 +1029,15 @@ def bias_display(bias):
     """页面卡片用的展示字段。"""
     payload = bias or empty_fund_bias()
     conf = float(payload.get("confidence") or 0)
+    components = payload.get("components") or {}
+    dates = []
+    for name in ("market", "north", "sector", "stock"):
+        item = components.get(name) or {}
+        date = item.get("data_date")
+        if date:
+            dates.append(f"{_LEG_CN.get(name, name)} {format_leg_date_caption(date)}")
+    quality_ok = bool(payload.get("quality_ok"))
+    insufficient = bool(payload.get("insufficient") or not quality_ok)
     return {
         "title": payload.get("label") or "资金面倾向（1–5日）",
         "disclaimer": payload.get("disclaimer") or "资金面倾向，不是涨跌预测",
@@ -981,6 +1051,10 @@ def bias_display(bias):
         "evidence": list(payload.get("evidence") or []),
         "reading": ((payload.get("components") or {}).get("divergence") or {}).get("reading") or "",
         "horizon": payload.get("horizon") or BIAS_HORIZON,
+        "quality_ok": quality_ok,
+        "insufficient": insufficient,
+        "leg_date_captions": dates,
+        "expected_daily_date": expected_daily_data_date().isoformat(),
     }
 
 
@@ -1004,6 +1078,26 @@ def market_fund_bias(market_df=None, north_df=None, sector_rank=None):
     result["scope"] = "market"
     result["legs_used"] = market_legs_used(sector_rank, result.get("components"))
     result["label"] = "资金面倾向（1–5日·市场级）"
+    components = result.get("components") or {}
+    if not market_primary_sufficient(components):
+        note = "市场级关键主数据不足（需可用的大盘主力或行业榜）；仅北向零信息不能作为有效主数据"
+        evidence = list(result.get("evidence") or [])
+        if note not in evidence:
+            evidence.append(note)
+        result.update(
+            {
+                "bias": BIAS_NEUTRAL,
+                "confidence": 0.0,
+                "confidence_label": "低",
+                "score_delta": 0.0,
+                "quality_ok": False,
+                "insufficient": True,
+                "net_vote": 0.0,
+                "evidence": evidence,
+            }
+        )
+    else:
+        result["insufficient"] = not bool(result.get("quality_ok"))
     return result
 
 

@@ -237,6 +237,24 @@ class SaimaSnapshotTests(unittest.TestCase):
         bad.attrs["ok"] = False
         self.assertEqual(extract_sector_leaders(bad), [])
 
+    def test_only_zero_north_export_is_insufficient(self):
+        north = _series([0, 0, 0, 0, 0, 0], col="net_inflow")
+        snapshot = build_saima_snapshot(
+            as_of_date="2026-11-09",
+            fetch_market=lambda: pd.DataFrame(),
+            fetch_north=lambda: north,
+            fetch_sector=lambda: pd.DataFrame(),
+        )
+        self.assertEqual(snapshot["as_of_date"], "2026-11-09")
+        self.assertEqual(snapshot["bias"], "中性")
+        self.assertFalse(snapshot["quality_ok"])
+        self.assertTrue(snapshot.get("insufficient"))
+        self.assertEqual(snapshot["score_delta"], 0)
+        self.assertEqual(snapshot["confidence"], 0)
+        self.assertEqual(snapshot["latest_trade_date"], "2024-01-06")
+        self.assertNotEqual(snapshot["as_of_date"], snapshot["latest_trade_date"])
+        json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
+
 
 class SaimaCliTests(unittest.TestCase):
     def test_write_and_cli_inbox_dir(self):

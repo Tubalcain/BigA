@@ -59,8 +59,26 @@ def _render_fund_bias_card(bias):
     c1, c2 = st.columns(2)
     c1.metric("倾向", view["bias"])
     c2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
+    if view.get("insufficient") or not view.get("quality_ok"):
+        st.warning("数据不足：缺少可用的大盘主力或行业榜。倾向占位为中性、信心 0、评分贡献 0。")
+    else:
+        st.caption("质量：关键主数据可用")
+    for line in view.get("leg_date_captions") or []:
+        st.caption(line)
     for line in view["evidence"][:8]:
         st.caption("· " + line)
+
+
+def _cache_caption(frame, label):
+    if frame is None or not hasattr(frame, "attrs"):
+        return
+    if frame.attrs.get("cache_stale"):
+        fetched = frame.attrs.get("cache_fetched_at") or "未知时间"
+        st.caption(f"{label}来自过期缓存（{fetched}），已标注来源/时效，不是新鲜数据。")
+    elif frame.attrs.get("cache_hit") in ("fresh", "coalesced"):
+        source = frame.attrs.get("cache_source") or frame.attrs.get("source") or ""
+        if source:
+            st.caption(f"{label}缓存命中 · 来源 {source}")
 
 
 def _flow_table(df, extra=None, rows=20):
@@ -219,11 +237,24 @@ with tab3:
         chart_gen = PlotlyChartGenerator()
 
         with st.spinner("正在获取资金流向..."):
-            sector = ak_data.get_sector_fund_flow(indicator=period, sector_type=sector_kind)
-            stock_rank = ak_data.get_stock_fund_flow_rank(indicator=period)
-            market_flow = ak_data.get_market_fund_flow()
-            north = ak_data.get_northbound_flow()
-            boards = ak_data.get_industry_boards()
+            from src.data.fetch import run_isolated
+
+            fetched = run_isolated(
+                {
+                    "sector": lambda: ak_data.get_sector_fund_flow(
+                        indicator=period, sector_type=sector_kind
+                    ),
+                    "stock_rank": lambda: ak_data.get_stock_fund_flow_rank(indicator=period),
+                    "market": lambda: ak_data.get_market_fund_flow(),
+                    "north": lambda: ak_data.get_northbound_flow(),
+                    "boards": lambda: ak_data.get_industry_boards(),
+                }
+            )
+            sector = fetched.get("sector")
+            stock_rank = fetched.get("stock_rank")
+            market_flow = fetched.get("market")
+            north = fetched.get("north")
+            boards = fetched.get("boards")
 
         sector = enrich_sector_flow(sector, boards)
 
@@ -233,6 +264,9 @@ with tab3:
             sector_rank=sector,
         )
         _render_fund_bias_card(market_bias)
+        _cache_caption(market_flow, "市场主力")
+        _cache_caption(sector, "板块榜")
+        _cache_caption(north, "北向")
         st.markdown("---")
 
         st.markdown("#### 市场资金")
@@ -339,4 +373,13 @@ with tab3:
 
 # 页脚
 st.markdown("---")
-st.caption(f"数据来源: AKShare / TuShare 回退 | 更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+try:
+    from src.data.calendar import shanghai_now as _shanghai_now
+
+    _now_label = _shanghai_now().strftime("%Y-%m-%d %H:%M:%S")
+except Exception:
+    _now_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+st.caption(
+    f"数据来源: AKShare / TuShare（东财 *_dc 不是独立备用） | 页面刷新 {_now_label} Asia/Shanghai；"
+    "行情日见各腿数据日期，as_of 不是今日行情。"
+)

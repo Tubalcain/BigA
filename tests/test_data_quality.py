@@ -12,7 +12,13 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 
 from src.data.cache import TTLCache, make_cache_key
-from src.data.fetch import DataFetchError, RateLimitError, call_with_timeout, is_rate_limited, with_retry
+from src.data.fetch import (
+    DataFetchError,
+    RateLimitError,
+    call_with_timeout,
+    is_rate_limited,
+    with_retry,
+)
 from src.data.config import get_data_config, load_app_config
 from src.data.quality import (
     attach_date_swap,
@@ -268,15 +274,22 @@ class CacheConfigTests(unittest.TestCase):
             get_data_config(reload=True)
 
     def test_rate_limit_is_not_retried(self):
-        self.assertTrue(is_rate_limited(RuntimeError("东方财富 当前 IP 被临时限流")))
+        class HTTP429(Exception):
+            def __init__(self):
+                self.status_code = 429
+                self.response = type("R", (), {"status_code": 429, "headers": {}})()
+                super().__init__("HTTP 429 Too Many Requests")
+
+        self.assertTrue(is_rate_limited(HTTP429()))
+        self.assertFalse(is_rate_limited(RuntimeError("东方财富 当前 IP 被临时限流")))
         calls = {"n": 0}
 
         def boom():
             calls["n"] += 1
-            raise RuntimeError("请求过于频繁，请稍后再试")
+            raise HTTP429()
 
         with self.assertRaises(RateLimitError):
-            with_retry(boom, retries=4, timeout=0, delay=0)
+            with_retry(boom, retries=4, timeout=0, delay=0, jitter=False)
         self.assertEqual(calls["n"], 1)
 
     def test_timeout_returns_without_waiting_for_worker(self):

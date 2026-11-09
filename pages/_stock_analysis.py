@@ -227,6 +227,10 @@ if analyze_btn or 'show_analysis' in st.session_state:
                 b1, b2 = st.columns(2)
                 b1.metric("倾向", view["bias"])
                 b2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
+                if view.get("insufficient") or not view.get("quality_ok"):
+                    st.caption("质量：数据不足，倾向占位为中性。")
+                for line in view.get("leg_date_captions") or []:
+                    st.caption(line)
                 for line in view["evidence"][:6]:
                     st.caption("· " + line)
                 if view["reading"]:

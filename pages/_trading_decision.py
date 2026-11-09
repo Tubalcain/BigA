@@ -256,6 +256,10 @@ if analyze_btn or 'analyze' in st.session_state:
             bc1.metric("倾向", view["bias"])
             bc2.metric("资金信心", view["confidence_label"], delta=view["confidence_pct"])
             bc3.metric("资金软分", view["score_delta"])
+            if view.get("insufficient") or not view.get("quality_ok"):
+                st.caption("质量：数据不足，倾向占位为中性；不改买卖动作。")
+            for line in view.get("leg_date_captions") or []:
+                st.caption(line)
             for line in view["evidence"][:6]:
                 st.caption("· " + line)
 
