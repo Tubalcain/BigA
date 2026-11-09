@@ -83,7 +83,16 @@ def _cache_caption(frame, label):
         bits.append(f"来源 {source}")
     if data_date:
         bits.append(f"数据日期 {data_date}")
-    if frame.attrs.get("cache_stale"):
+    from src.analysis.fund_flow import evidence_fresh
+
+    _fresh, why = evidence_fresh(frame)
+    if why == "publish_delay":
+        bits.append("收盘发布延迟，上一完整交易日暂用")
+    elif why == "stale_data_date":
+        bits.append("数据日期过旧，拒绝计入")
+    elif why == "future_date":
+        bits.append("未来日期，拒绝计入")
+    if frame.attrs.get("cache_stale") or why == "stale_cache":
         bits.append(f"过期缓存（{fetched or '未知时间'}），不是新鲜数据")
     elif hit:
         bits.append(f"缓存 {hit}")

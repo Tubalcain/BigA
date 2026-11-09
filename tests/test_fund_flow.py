@@ -2,6 +2,7 @@
 
 import sys
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -364,6 +365,16 @@ class FlowAnalysisTests(unittest.TestCase):
 
 
 class FlowBiasTests(unittest.TestCase):
+    def setUp(self):
+        from src.data.calendar import SHANGHAI, set_now_override
+
+        set_now_override(datetime(2026, 11, 9, 10, 0, tzinfo=SHANGHAI))
+
+    def tearDown(self):
+        from src.data.calendar import set_now_override
+
+        set_now_override(None)
+
     def _end(self):
         from src.data.calendar import expected_daily_data_date
 
@@ -711,6 +722,69 @@ class FlowBiasTests(unittest.TestCase):
         self.assertTrue(bias["quality_ok"])
         self.assertFalse(bias.get("insufficient"))
         self.assertEqual(bias["bias"], "中性")
+
+    def test_close_publish_grace_allows_previous_day_then_expires(self):
+        from src.analysis.fund_flow import evidence_fresh
+        from src.data.calendar import SHANGHAI, set_now_override
+
+        thursday = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-11-05"] * 6),
+                "main_net_inflow": [80, 90, 100, 110, 120, 130],
+            }
+        )
+        friday_close = datetime(2026, 11, 6, 15, 30, tzinfo=SHANGHAI)
+        set_now_override(friday_close)
+        fresh, why = evidence_fresh(thursday, now=friday_close)
+        self.assertTrue(fresh)
+        self.assertEqual(why, "publish_delay")
+        bias = market_fund_bias(market_df=thursday, now=friday_close)
+        self.assertTrue(bias["quality_ok"])
+        self.assertEqual(bias["bias"], "偏多")
+        self.assertEqual((bias.get("components") or {}).get("market", {}).get("freshness"), "publish_delay")
+        view = bias_display(bias)
+        self.assertTrue(any("收盘发布延迟" in line for line in view["leg_date_captions"]))
+
+        friday_late = datetime(2026, 11, 6, 17, 0, tzinfo=SHANGHAI)
+        set_now_override(friday_late)
+        late_fresh, late_why = evidence_fresh(thursday, now=friday_late)
+        self.assertFalse(late_fresh)
+        self.assertEqual(late_why, "stale_data_date")
+        late_bias = market_fund_bias(market_df=thursday, now=friday_late)
+        self.assertFalse(late_bias["quality_ok"])
+        self.assertIn("market", late_bias.get("dropped_legs") or [])
+        late_view = bias_display(late_bias)
+        self.assertTrue(any("数据日期过旧" in line for line in late_view["leg_date_captions"]))
+
+        stale = thursday.copy()
+        stale.attrs["cache_stale"] = True
+        stale.attrs["issues"] = ["stale_cache"]
+        set_now_override(friday_close)
+        cache_fresh, cache_why = evidence_fresh(stale, now=friday_close)
+        self.assertFalse(cache_fresh)
+        self.assertEqual(cache_why, "stale_cache")
+
+        monday = datetime(2026, 11, 9, 10, 0, tzinfo=SHANGHAI)
+        friday_complete = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-11-06"] * 6),
+                "main_net_inflow": [80, 90, 100, 110, 120, 130],
+            }
+        )
+        set_now_override(monday)
+        mon_fresh, mon_why = evidence_fresh(friday_complete, now=monday)
+        self.assertTrue(mon_fresh)
+        self.assertIsNone(mon_why)
+        wed = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-11-04"] * 6),
+                "main_net_inflow": [80, 90, 100, 110, 120, 130],
+            }
+        )
+        set_now_override(friday_close)
+        old_fresh, old_why = evidence_fresh(wed, now=friday_close)
+        self.assertFalse(old_fresh)
+        self.assertEqual(old_why, "stale_data_date")
 
 
 class FlowAdapterEmptyTests(unittest.TestCase):

@@ -13,7 +13,13 @@ import math
 import numpy as np
 import pandas as pd
 
-from src.data.calendar import expected_daily_data_date, format_leg_date_caption, shanghai_today
+from src.data.calendar import (
+    expected_daily_data_date,
+    format_leg_date_caption,
+    in_close_publish_grace,
+    previous_trading_day,
+    shanghai_today,
+)
 from src.data.quality import _ok_from_flow_issues, _ok_from_ohlcv_issues, sector_type_short
 
 
@@ -549,7 +555,7 @@ def market_primary_sufficient(components):
     return False
 
 
-def attach_leg_dates(components, frames):
+def attach_leg_dates(components, frames, now=None):
     for name, df in frames:
         if name not in components:
             continue
@@ -561,13 +567,18 @@ def attach_leg_dates(components, frames):
         item.setdefault("cache_hit", df.attrs.get("cache_hit"))
         item.setdefault("cache_stale", bool(df.attrs.get("cache_stale")))
         item.setdefault("cache_fetched_at", df.attrs.get("cache_fetched_at"))
+        if df.attrs.get("freshness"):
+            item.setdefault("freshness", df.attrs.get("freshness"))
+        _fresh, why = evidence_fresh(df, now=now)
+        if why:
+            item.setdefault("freshness", why)
     return components
 
 
 def evidence_fresh(df, now=None):
     """
     日频允许上一真实交易日；陈旧缓存可展示但不算新证据；未来日期拒绝。
-    无日期的排名表只看 cache_stale。
+    收盘发布宽限内可用上一完整交易日并标 publish_delay。无日期的排名表只看 cache_stale。
     """
     if df is None or getattr(df, "empty", True):
         return True, None
@@ -577,10 +588,16 @@ def evidence_fresh(df, now=None):
     data_date = _frame_data_date(df)
     if data_date is None:
         return True, None
-    today = shanghai_today(now).isoformat()
-    if data_date > today:
+    today = shanghai_today(now)
+    today_iso = today.isoformat()
+    if data_date > today_iso:
         return False, "future_date"
     expected = expected_daily_data_date(now).isoformat()
+    if data_date == expected:
+        return True, None
+    previous = previous_trading_day(today, now=now).isoformat()
+    if in_close_publish_grace(now) and data_date == previous:
+        return True, "publish_delay"
     if data_date < expected:
         return False, "stale_data_date"
     return True, None
@@ -837,6 +854,7 @@ def fund_flow_bias(
     sector_rank=None,
     stock_flow=None,
     price_df=None,
+    now=None,
 ):
     """
     合成短周期资金面倾向。返回偏多/偏空/中性/分化，不是涨跌预测。
@@ -849,6 +867,8 @@ def fund_flow_bias(
     dropped_legs = []
     caution = False
 
+    freshness_ok = {}
+
     def _take(name, df):
         if not _frame_has_rows(df):
             components[name] = _leg_component(available=False)
@@ -858,17 +878,20 @@ def fund_flow_bias(
             components[name] = _leg_component(available=True, quality_ok=False)
             evidence.append(f"{_LEG_CN.get(name, name)}数据质量不足，该腿不计入")
             return False
-        fresh, why = evidence_fresh(df)
+        fresh, why = evidence_fresh(df, now=now)
         if not fresh:
             dropped_legs.append(name)
             components[name] = _leg_component(available=True, quality_ok=False, freshness=why)
             label = {
                 "stale_cache": "陈旧缓存仅供展示，不作为有效新证据",
                 "future_date": "未来日期，拒绝计入",
-                "stale_data_date": "数据日期早于上一交易日，不作为有效新证据",
+                "stale_data_date": "数据日期过旧，拒绝计入",
             }.get(why, "时效不足，不计入")
             evidence.append(f"{_LEG_CN.get(name, name)}{label}")
             return False
+        freshness_ok[name] = why
+        if why == "publish_delay":
+            evidence.append(f"{_LEG_CN.get(name, name)}收盘发布延迟，暂用上一完整交易日")
         return True
 
     if _take("market", market_df):
@@ -889,7 +912,11 @@ def fund_flow_bias(
             if accel.get("sign") and sign == 0:
                 sign = int(accel["sign"])
         components["market"] = _leg_component(
-            sign=sign, available=True, streak=streak, accel=accel.get("label") or ""
+            sign=sign,
+            available=True,
+            streak=streak,
+            accel=accel.get("label") or "",
+            freshness=freshness_ok.get("market"),
         )
         if sign:
             votes.append(("market", sign, 1.5))
@@ -900,7 +927,10 @@ def fund_flow_bias(
         if regime.get("note") and regime.get("regime") != "unknown":
             evidence.append(regime["note"])
         components["north"] = _leg_component(
-            sign=sign, available=True, regime=regime.get("regime")
+            sign=sign,
+            available=True,
+            regime=regime.get("regime"),
+            freshness=freshness_ok.get("north"),
         )
         if sign:
             votes.append(("north", sign, 1.0))
@@ -919,6 +949,7 @@ def fund_flow_bias(
                 usable_for_rotation=False,
                 inflow_count=rot.get("inflow_count"),
                 outflow_count=rot.get("outflow_count"),
+                freshness=freshness_ok.get("sector"),
             )
         else:
             sign = int(rot.get("sign") or 0)
@@ -932,6 +963,7 @@ def fund_flow_bias(
                 inflow_count=rot.get("inflow_count"),
                 outflow_count=rot.get("outflow_count"),
                 top_concentration=rot.get("top_concentration"),
+                freshness=freshness_ok.get("sector"),
             )
             if sign:
                 votes.append(("sector", sign, 1.0))
@@ -958,7 +990,11 @@ def fund_flow_bias(
             if accel.get("sign") and sign == 0:
                 sign = int(accel["sign"])
         components["stock"] = _leg_component(
-            sign=sign, available=True, streak=stock_streak, accel=accel.get("label") or ""
+            sign=sign,
+            available=True,
+            streak=stock_streak,
+            accel=accel.get("label") or "",
+            freshness=freshness_ok.get("stock"),
         )
         if sign:
             votes.append(("stock", sign, 1.2))
@@ -1014,7 +1050,11 @@ def fund_flow_bias(
             ("sector", sector_rank),
             ("stock", stock_flow),
         ),
+        now=now,
     )
+    for name, why in freshness_ok.items():
+        if why and name in components:
+            components[name].setdefault("freshness", why)
 
     if not evidence:
         result["components"] = components
@@ -1095,9 +1135,20 @@ def bias_display(bias):
             parts.append(format_leg_date_caption(date))
         if source:
             parts.append(f"来源 {source}")
-        if item.get("cache_stale") or item.get("cache_hit") in ("stale", "failure", "cooldown"):
+        freshness = item.get("freshness")
+        if freshness == "publish_delay":
+            parts.append("收盘发布延迟，上一完整交易日暂用")
+        elif freshness == "stale_data_date":
+            parts.append("数据日期过旧，拒绝计入")
+        elif freshness == "future_date":
+            parts.append("未来日期，拒绝计入")
+        elif freshness == "stale_cache" or item.get("cache_stale") or item.get("cache_hit") in (
+            "stale",
+            "failure",
+            "cooldown",
+        ):
             fetched = item.get("cache_fetched_at") or ""
-            parts.append("陈旧缓存" + (f"（{fetched}）" if fetched else ""))
+            parts.append("陈旧缓存" + (f"（{fetched}）" if fetched else "") + "，不作为新证据")
         elif item.get("cache_hit"):
             parts.append(f"缓存 {item.get('cache_hit')}")
         if parts:
@@ -1138,9 +1189,11 @@ def market_legs_used(sector_rank=None, components=None):
     return f"市场主力 / 北向 / {label}"
 
 
-def market_fund_bias(market_df=None, north_df=None, sector_rank=None):
+def market_fund_bias(market_df=None, north_df=None, sector_rank=None, now=None):
     """市场级资金面倾向：大盘主力 + 北向 + 板块榜。不含个股。"""
-    result = fund_flow_bias(market_df=market_df, north_df=north_df, sector_rank=sector_rank)
+    result = fund_flow_bias(
+        market_df=market_df, north_df=north_df, sector_rank=sector_rank, now=now
+    )
     result["scope"] = "market"
     result["legs_used"] = market_legs_used(sector_rank, result.get("components"))
     result["label"] = "资金面倾向（1–5日·市场级）"
@@ -1167,7 +1220,7 @@ def market_fund_bias(market_df=None, north_df=None, sector_rank=None):
     return result
 
 
-def stock_fund_bias(stock_flow=None, price_df=None, market_df=None, north_df=None):
+def stock_fund_bias(stock_flow=None, price_df=None, market_df=None, north_df=None, now=None):
     """
     个股级资金面倾向。个股分析页与交易决策页必须走这里，输入维度一致：
     个股资金流 + 价格 + 市场主力 + 北向。不含板块榜（板块轮动只在市场级）。
@@ -1175,6 +1228,7 @@ def stock_fund_bias(stock_flow=None, price_df=None, market_df=None, north_df=Non
     result = fund_flow_bias(
         market_df=market_df,
         north_df=north_df,
+        now=now,
         stock_flow=stock_flow,
         price_df=price_df,
     )

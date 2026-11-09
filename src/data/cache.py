@@ -119,6 +119,31 @@ def _jsonable(obj, depth=0):
     return str(obj)
 
 
+def _dtype_name(dtype):
+    try:
+        return dtype.name
+    except Exception:
+        return str(dtype)
+
+
+def _apply_frame_meta(frame, *, index_name=None, dtypes=None):
+    import pandas as pd
+
+    if index_name is not None:
+        frame.index.name = index_name
+    for column, name in (dtypes or {}).items():
+        if column not in frame.columns:
+            continue
+        try:
+            if str(name).startswith("datetime64"):
+                frame[column] = pd.to_datetime(frame[column], errors="coerce")
+            else:
+                frame[column] = frame[column].astype(name)
+        except Exception:
+            continue
+    return frame
+
+
 def encode_cache_value(value):
     try:
         import pandas as pd
@@ -127,8 +152,15 @@ def encode_cache_value(value):
     if pd is not None and isinstance(value, pd.DataFrame):
         work = value.copy()
         attrs = _jsonable(dict(work.attrs))
-        payload = json.loads(work.to_json(orient="split", date_format="iso"))
-        return {"__biga__": "df", "data": payload, "attrs": attrs}
+        dtypes = {str(col): _dtype_name(dtype) for col, dtype in work.dtypes.items()}
+        table = json.loads(work.to_json(orient="table", date_format="iso"))
+        return {
+            "__biga__": "df",
+            "table": table,
+            "index_name": work.index.name,
+            "dtypes": dtypes,
+            "attrs": attrs,
+        }
     if isinstance(value, dict):
         return {"__biga__": "dict", "data": _jsonable(value)}
     if isinstance(value, list):
@@ -142,12 +174,22 @@ def decode_cache_value(payload):
     kind = payload.get("__biga__")
     if kind == "df":
         import pandas as pd
+        from io import StringIO
 
-        data = payload.get("data") or {}
-        frame = pd.DataFrame(
-            data.get("data") or [],
-            columns=data.get("columns"),
-            index=data.get("index"),
+        table = payload.get("table")
+        if table:
+            frame = pd.read_json(StringIO(json.dumps(table)), orient="table")
+        else:
+            data = payload.get("data") or {}
+            frame = pd.DataFrame(
+                data.get("data") or [],
+                columns=data.get("columns"),
+                index=data.get("index"),
+            )
+        frame = _apply_frame_meta(
+            frame,
+            index_name=payload.get("index_name"),
+            dtypes=payload.get("dtypes"),
         )
         if "date" in frame.columns:
             frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
@@ -273,6 +315,13 @@ class TTLCache:
                 return False
             return True
 
+    def cooldown_remaining(self, key):
+        if not self.in_cooldown(key):
+            return 0.0
+        with self._lock:
+            expires = float(self._cooldowns.get(key) or 0)
+        return max(0.0, expires - self.now())
+
     def clear(self):
         with self._lock:
             self._store.clear()
@@ -352,6 +401,92 @@ class SharedTTLCache(TTLCache):
         if path is None:
             return None
         return path.with_suffix(".lock")
+
+    def _cooldown_path(self, key):
+        if not self.directory:
+            return None
+        safe = hashlib.sha1(key.encode("utf-8")).hexdigest()
+        return self.directory / f"biga-{CACHE_FORMAT}-{safe}.cooldown.json"
+
+    def _write_cooldown_disk(self, key, expires_at):
+        path = self._cooldown_path(key)
+        if not self.persist or path is None:
+            return
+        if expires_at is None or expires_at <= self.now():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return
+        payload = {"format": CACHE_FORMAT, "key": key, "expires_at": float(expires_at)}
+        fd, tmp_name = tempfile.mkstemp(prefix=".biga-cool.", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(CACHE_MAGIC)
+                handle.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception as exc:
+            logger.warning("写入冷却元信息失败: %s", exc)
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+    def _read_cooldown_disk(self, key):
+        path = self._cooldown_path(key)
+        if not self.persist or path is None or not path.exists():
+            return None
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if not raw.startswith(CACHE_MAGIC):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        try:
+            payload = json.loads(raw[len(CACHE_MAGIC) :].decode("utf-8"))
+            expires = float(payload.get("expires_at") or 0)
+        except Exception:
+            return None
+        if expires <= self.now():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        return expires
+
+    def set_cooldown(self, key, ttl):
+        super().set_cooldown(key, ttl)
+        ttl = int(ttl or 0)
+        expires = self.now() + ttl if ttl > 0 else None
+        self._write_cooldown_disk(key, expires)
+
+    def in_cooldown(self, key):
+        if super().in_cooldown(key):
+            return True
+        expires = self._read_cooldown_disk(key)
+        if expires is None:
+            return False
+        with self._lock:
+            self._cooldowns[key] = expires
+        return True
+
+    def cooldown_remaining(self, key):
+        if not self.in_cooldown(key):
+            return 0.0
+        with self._lock:
+            expires = float(self._cooldowns.get(key) or 0)
+        return max(0.0, expires - self.now())
 
     def _read_disk(self, key):
         path = self._disk_path(key)
@@ -649,6 +784,10 @@ def cached_load(
         return _from_entry(fresh, "fresh", stale=False)
 
     def _load():
+        if hasattr(cache, "in_cooldown") and cache.in_cooldown(key):
+            cooled = _failure_frame("cooldown")
+            if cooled is not None:
+                return cooled
         again = cache.get_entry(key, allow_expired=False) if hasattr(cache, "get_entry") else cache.get(key)
         if again is not None and hasattr(again, "value") and getattr(again, "ok", True):
             return _from_entry(again, "coalesced", stale=False)

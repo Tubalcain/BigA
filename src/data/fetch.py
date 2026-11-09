@@ -101,6 +101,16 @@ GATE_ACQUIRE_TIMEOUT = 12
 ISOLATED_MAX_WORKERS = 2
 
 
+def _limit_from_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 class DataFetchError(Exception):
     """可重试的数据获取失败。"""
 
@@ -470,6 +480,54 @@ def _gate_directory():
         return Path(os.environ.get("BIGA_CACHE_DIR") or "data/cache")
 
 
+class GateLease:
+    """闸门占用覆盖真实 worker 存活；超时返回后仍持有直到线程结束。进程退出由 OS 回收。"""
+
+    def __init__(self, local, handle, name):
+        self._local = local
+        self._handle = handle
+        self.name = name
+        self._worker = None
+        self._released = False
+        self._lock = threading.Lock()
+
+    def attach_worker(self, thread):
+        self._worker = thread
+
+    def release(self):
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            handle = self._handle
+            self._handle = None
+            if handle is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            try:
+                self._local.release()
+            except ValueError:
+                pass
+
+    def release_when_idle(self):
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            def _reap():
+                worker.join()
+                self.release()
+
+            threading.Thread(target=_reap, name=f"biga-gate-reap-{self.name}", daemon=True).start()
+            return
+        self.release()
+
+
 class _FileSemaphore:
     """跨进程有界并发。崩溃由 OS 释放 flock；挂起的 owner 只阻塞到 timeout。"""
 
@@ -488,9 +546,10 @@ class _FileSemaphore:
         if not self._local.acquire(timeout=wait):
             raise GateTimeout(f"upstream gate busy: {self.name}")
         try:
-            fd = self._acquire_slot(deadline)
-            self._held.fd = fd
-            return True
+            handle = self._acquire_slot(deadline)
+            lease = GateLease(self._local, handle, self.name)
+            self._held.lease = lease
+            return lease
         except Exception:
             self._local.release()
             raise
@@ -533,39 +592,29 @@ class _FileSemaphore:
             time.sleep(0.05)
 
     def release(self):
-        handle = getattr(self._held, "fd", None)
-        if handle is not None:
-            try:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                handle.close()
-            except OSError:
-                pass
-            self._held.fd = None
-        try:
-            self._local.release()
-        except ValueError:
-            pass
+        lease = getattr(self._held, "lease", None)
+        if lease is not None:
+            lease.release()
+            self._held.lease = None
 
     def __enter__(self):
-        self.acquire()
-        return self
+        return self.acquire()
 
     def __exit__(self, exc_type, exc, tb):
-        self.release()
+        lease = getattr(self._held, "lease", None)
+        if lease is not None:
+            lease.release_when_idle()
+            self._held.lease = None
         return False
 
 
 def upstream_gate(name="eastmoney", limit=None, timeout=None, directory=None):
     key = str(name or "other")
     if key in ("eastmoney", "akshare"):
-        cap = EASTMONEY_LIMIT if limit is None else int(limit)
+        cap = _limit_from_env("BIGA_EASTMONEY_LIMIT", EASTMONEY_LIMIT) if limit is None else int(limit)
         key = "eastmoney"
     elif key == "tushare":
-        cap = TUSHARE_LIMIT if limit is None else int(limit)
+        cap = _limit_from_env("BIGA_TUSHARE_LIMIT", TUSHARE_LIMIT) if limit is None else int(limit)
     else:
         cap = 4 if limit is None else int(limit)
     with _GATES_LOCK:
@@ -588,7 +637,7 @@ def reset_upstream_gates():
         _GATES.clear()
 
 
-def call_with_timeout(func, timeout, *args, inflight_key=None, **kwargs):
+def call_with_timeout(func, timeout, *args, inflight_key=None, gate_lease=None, **kwargs):
     """
     在 daemon 线程中执行调用。timeout<=0 表示不限时。
 
@@ -628,6 +677,8 @@ def call_with_timeout(func, timeout, *args, inflight_key=None, **kwargs):
                 raise InFlightBusy(f"in-flight {key}: skip stacked call")
             _INFLIGHT[key] = thread
     thread.start()
+    if gate_lease is not None:
+        gate_lease.attach_worker(thread)
     try:
         thread.join(timeout)
         if thread.is_alive():
@@ -688,6 +739,7 @@ def with_retry(
     jitter=True,
     label="",
     inflight_key=None,
+    gate_lease=None,
 ):
     """
     执行 func()，失败则有界退避。总时间受 budget 约束。
@@ -728,7 +780,9 @@ def with_retry(
             if timeout > 0:
                 attempt_timeout = min(timeout, remaining)
             try:
-                result = call_with_timeout(func, attempt_timeout, inflight_key=key)
+                result = call_with_timeout(
+                    func, attempt_timeout, inflight_key=key, gate_lease=gate_lease
+                )
                 last_diag.attempts = attempt
                 last_diag.elapsed_ms = int((time.monotonic() - started) * 1000)
                 last_diag.category = "ok"
@@ -830,7 +884,7 @@ def safe_fetch(
 ):
     """捕获全部异常，失败时返回 default，供页面侧优雅降级。"""
 
-    def _call():
+    def _call(gate_lease=None):
         return with_retry(
             func,
             retries=retries,
@@ -839,16 +893,20 @@ def safe_fetch(
             budget=budget,
             label=label,
             inflight_key=label or None,
+            gate_lease=gate_lease,
         )
 
+    lease = None
     try:
         if upstream:
             remaining = None
             if budget:
                 remaining = float(budget)
-            gate = upstream_gate(upstream, timeout=min(GATE_ACQUIRE_TIMEOUT, remaining or GATE_ACQUIRE_TIMEOUT))
-            with gate:
-                return _call()
+            gate = upstream_gate(
+                upstream, timeout=min(GATE_ACQUIRE_TIMEOUT, remaining or GATE_ACQUIRE_TIMEOUT)
+            )
+            lease = gate.acquire()
+            return _call(gate_lease=lease)
         return _call()
     except Exception as exc:
         diag = last_fetch_diagnostic() or classify_exception(exc)
@@ -876,6 +934,9 @@ def safe_fetch(
             except Exception:
                 pass
         return default
+    finally:
+        if lease is not None:
+            lease.release_when_idle()
 
 
 def run_isolated(jobs, timeout=None, max_workers=None):

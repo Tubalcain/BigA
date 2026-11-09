@@ -346,6 +346,7 @@ def build_saima_snapshot(
         market_df=frames.get("market"),
         north_df=frames.get("north"),
         sector_rank=frames.get("sector"),
+        now=now,
     )
     native = to_jsonable(bias) or {}
     payload = {key: native.get(key) for key in NATIVE_BIAS_KEYS}
