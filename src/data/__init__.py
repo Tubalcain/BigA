@@ -10,6 +10,7 @@
 """
 
 from .akshare_data import AKShareData, AKShareIndicator
+from .cache import reset_cache
 from .config import get_data_config, load_app_config
 from .quality import describe_data_problems, outlier_count
 from .tushare_data import TuShareData
@@ -25,6 +26,7 @@ __all__ = [
     "describe_data_problems",
     "outlier_count",
     "source_switch_note",
+    "reset_cache",
 ]
 
 

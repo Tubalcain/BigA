@@ -32,9 +32,10 @@
 - 中英列名映射到同一套英文 schema；报价丢掉未知列和空/非法代码。
 - 日期为 **Asia/Shanghai 日历日**（naive midnight）；`2024-1-2` / `2024/01/02` 会收成 `YYYYMMDD`；起止颠倒会**先交换再请求上游**，并标记 `date_range_swapped`。
 - 去重、丢弃缺 OHLC 的 bar、把 high/low 钳到包含 open/close，标记 `is_outlier`；页面会提示异常 K 线数量。
-- 空态可用 `describe_data_problems(df)` 收成一行给 UI；源切换用 `source_switch_note`。TTL 缓存只保存校验通过的历史 K 线；超时立刻返回，不等后台线程。
-- 资金流：东财排名按元、HSGT 历史按万、TuShare HSGT 按百万换算为万元；`auto` 只作兜底并做量级校验。周期/板块回退会写入 `actual_period` / `actual_sector` 和 `period_fallback:5日→今日` 这类 issues，UI 展示实际值。TuShare 行业/个股排名只有日频，多日请求会空表或回退 AKShare，不会盖请求周期的假章。概念/地域互相重叠，合计不当作全市场。分析在 `src/analysis/fund_flow.py`（排名、主力 vs 散户、趋势、价资背离、`market_fund_bias` / `stock_fund_bias` 短周期倾向）。倾向是 1–5 日方向，不是涨跌预测。个股分析页与交易决策页共用个股级输入（个股资金、价资、市场主力、北向）。坏腿只剔除该腿；不合格个股表不算价资背离。`apply_fund_flow_bias` 只记软参考分，**不改**技术面买卖动作。
-- TuShare 行业与大盘资金接口（`moneyflow_ind_dc` / `moneyflow_mkt_dc`）需要积分，没有权限时回退 AKShare，不会假装有数据。OpenBB 未接入。
+- 空态可用 `describe_data_problems(df)` 收成一行给 UI；源切换用 `source_switch_note`。Web/CLI 共享 `data/cache`（JSON，不反序列化 pickle）。逻辑键按源/参数，**不把上海时段写进键**，以便跨日回退最后好数据；TTL 仍按盘中缩短。失败冷却与好数据分离：空表或异常不会覆盖最后好缓存，失败命中 `fresh=False`，陈旧回退有最大年龄。跨进程用 flock，锁等待有上限，owner 崩溃由 OS 释放；挂起的 owner 不会永久堵住。超时立刻返回且**不再叠加重试**；同键在途拒绝再开线程。**不能**强制杀掉 AKShare 分页线程（daemon，进程退出不等待）。断连/5xx 才有界退避，总时间受 `retry_budget` 约束。真正的 HTTP 429 才按限流并尊重 `Retry-After`（数字或 HTTP-date）；4xx 不重试。无 HTTP 码的 `Push2RateLimitError`（「当前IP被临时限流」）记 `rate_limit_heuristic`，**不是** 429，冷却且不立即重试；有 `RemoteDisconnected` cause 仍记 `disconnect`。东财上游全进程最多约 2 路并发（Web/CLI 尽量共用闸门），不靠加大 timeout。
+- 资金流：东财排名按元、HSGT 历史按万、TuShare HSGT 按百万换算为万元；`auto` 只作兜底并做量级校验。周期/板块回退会写入 `actual_period` / `actual_sector` 和 `period_fallback:5日→今日` 这类 issues，UI 展示实际值。TuShare 行业/个股排名只有日频，多日请求会空表，不会盖请求周期的假章。概念/地域互相重叠，合计不当作全市场。分析在 `src/analysis/fund_flow.py`（排名、主力 vs 散户、趋势、价资背离、`market_fund_bias` / `stock_fund_bias` 短周期倾向）。倾向是 1–5 日方向，不是涨跌预测。个股分析页与交易决策页共用个股级输入（个股资金、价资、市场主力、北向）。坏腿只剔除该腿；不合格个股表不算价资背离。`apply_fund_flow_bias` 只记软参考分，**不改**技术面买卖动作。
+- 市场级 `quality_ok`：需要至少一条可用的**关键主数据**（大盘主力，或非重叠行业榜）。有效主腿中性仍是中性、不是数据不足。缺主数据且只剩北向零净额/mixed 时为 **insufficient**。陈旧缓存/未来日期/早于上一交易日的日频不计入投票（仍可展示来源日期与拒绝原因）。交易日收盘后 90 分钟内允许上一完整交易日作为发布延迟暂用。交易日历 bundled 来自上交所公告（2024–2026），**不**把国务院行政调休当成开市，也**不**在 `calendar.py` 拉网；未知年份只做周末休市+工作日近似。各腿展示 Asia/Shanghai 真实数据日期与缓存来源；**不要把 `as_of_date` 当成今日行情**。
+- TuShare 备用限制：`moneyflow_ind_dc` / `moneyflow_mkt_dc` 与 AKShare 东财 push2 **同一上游**。传输故障（超时/断连）拒绝备用，避免双打。积分不足、无 token、权限错误允许换客户端降级，但会标 `same_upstream_degrade:eastmoney`，**不是独立源**。北向 `moneyflow_hsgt` 在配置了 `TUSHARE_TOKEN` 且账号有权限时才是独立源。不会发明第三源或因 mock 通过而承诺上游恢复。OpenBB 未接入。
 
 ## 快速开始
 
@@ -64,7 +65,19 @@ set TUSHARE_TOKEN=your_token_here
 
 也可以复制 `.env.example` 为 `.env`。环境变量优先于 YAML 里的空 `token` 字段。
 
-其它可选变量：`BIGA_DATA_PRIMARY=akshare|tushare`、`BIGA_DATA_FALLBACK=true`、`BIGA_AKSHARE_ADJUST=qfq`。
+其它可选变量：`BIGA_DATA_PRIMARY=akshare|tushare`、`BIGA_DATA_FALLBACK=true`、`BIGA_AKSHARE_ADJUST=qfq`、`BIGA_CACHE_ENABLED=true`、`BIGA_CACHE_PERSIST=true`、`BIGA_CACHE_DIR=data/cache`。
+
+### 缓存清理
+
+共享缓存目录默认 `data/cache`（已 gitignore）。清缓存：
+
+```bash
+rm -rf data/cache
+# 或
+python -c "from src.data import reset_cache; reset_cache()"
+```
+
+盘中资金流默认约 30s 过期；失败约 45s 冷却。不要靠循环刷新硬打上游。本仓库**不**内置 routine/cron。
 
 ### 3. 运行应用
 
@@ -76,13 +89,13 @@ streamlit run app.py
 
 ### 4. 验证数据源
 
-离线（模式/缓存/配置，不打外部 API）：
+离线（模式/缓存/配置/稳定性，不打外部 API）：
 
 ```bash
-python -m unittest tests.test_data_quality
+python -m unittest tests.test_data_quality tests.test_fund_flow tests.test_saima_export tests.test_market_stability
 ```
 
-在线冒烟（需要能访问 AKShare；TuShare 无 token 会跳过）：
+在线冒烟请**少量、有界**（需要能访问 AKShare；TuShare 无 token 会跳过，不要对空表压测）：
 
 ```bash
 python examples/test_data_source.py
@@ -90,7 +103,7 @@ python examples/test_data_source.py
 
 ### 5. 导出 Saima 资金流快照
 
-把市场级 `market_fund_bias`（大盘主力 / 北向 / 行业板块榜）写成 JSON，供外部治理仓落盘到 `/workspace/Saima/inbox/biga/YYYY-MM-DD.json`。单腿超时或无 Token 会降级，三腿全挂也输出合法快照（`bias=中性`、`quality_ok=false`、`score_delta=0`）。不在目标目录执行 git。
+把市场级 `market_fund_bias`（大盘主力 / 北向 / 行业板块榜）写成 JSON，供外部治理仓落盘到 `/workspace/Saima/inbox/biga/YYYY-MM-DD.json`。单腿超时或无 Token 会降级，三腿全挂或仅北向零信息也输出合法快照（`bias=中性`、`quality_ok=false`、`score_delta=0`）。`as_of_date` 是快照请求日，行情日看 `latest_trade_date` / 各腿 `data_date`。不在目标目录执行 git。
 
 ```bash
 python -m src.cli.export_saima_snapshot --date 2026-11-06 --inbox-dir /workspace/Saima/inbox/biga
@@ -115,7 +128,7 @@ python -m unittest tests.test_saima_export
 - **股票分析**：历史行情 + 技术指标，可在 AKShare / TuShare 间切换
 - **股票筛选**：按交易所、市值（万元）、涨跌幅、成交量（手）、停牌过滤
 - **投资组合**：用实时 `price` 估值
-- **市场分析**：指数、涨跌分布、排行、板块/个股/北向资金流向与图表（源站限流时自动降级并写出 `issues`）
+- **市场分析**：指数、涨跌分布、排行、板块/个股/北向资金流向与图表（超时/断连/空 JSON 会写出诊断；无 HTTP 码则为 unknown，不把启发式包装当成 429）
 
 指标说明见 [TRADING_INDICATORS_GUIDE.md](TRADING_INDICATORS_GUIDE.md)。故障见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
@@ -128,11 +141,12 @@ bigA/
 ├── config/config.yaml
 ├── .env.example
 ├── src/
-│   ├── data/                      # 数据采集（本次补齐）
+│   ├── data/                      # 数据采集
 │   │   ├── __init__.py
 │   │   ├── config.py              # YAML + 环境变量
 │   │   ├── quality.py             # 列名/类型/清洗
-│   │   ├── cache.py / fetch.py    # TTL 缓存、超时重试
+│   │   ├── calendar.py            # Asia/Shanghai 交易时段
+│   │   ├── cache.py / fetch.py    # 持久缓存、并发合并、有界重试与诊断
 │   │   ├── akshare_data.py
 │   │   └── tushare_data.py
 │   ├── analysis/                 # 技术指标 + 资金流分析 + Saima 快照
@@ -149,14 +163,15 @@ bigA/
 ├── examples/test_data_source.py
 ├── tests/test_data_quality.py
 ├── tests/test_fund_flow.py
+├── tests/test_market_stability.py
 ├── tests/test_saima_export.py
 └── data/                          # 本地缓存目录（gitignored）
 ```
 
 ## 注意事项
 
-1. **TuShare** 免费积分有调用频率和权限限制；没有 token 时页面会回退到 AKShare。
-2. **AKShare** 依赖东财/新浪等站点，偶发限流或改字段；适配器按多种 API 回退，并缓存快照。
+1. **TuShare** 需要 `TUSHARE_TOKEN` 和相应积分/权限。没有 token 时不要搜仓库或日志里的密钥；北向独立备用不可用，等待本地配置。东财 DC 接口不是 AKShare 的独立备用。
+2. **AKShare** 依赖东财/新浪等站点，可能超时、断连或返回非 JSON。适配器有界重试并缓存快照；**不能保证**远端恢复。启发式 `Push2RateLimitError` 不是 HTTP 429。
 3. 停牌、周末、退市股票可能只有历史或空报价；实时失败时会用最近一根 K 线的收盘价兜底。
 4. 本工具仅供研究，不构成投资建议。
 

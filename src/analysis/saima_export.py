@@ -49,6 +49,7 @@ NATIVE_BIAS_KEYS = (
     "disclaimer",
     "scope",
     "legs_used",
+    "insufficient",
 )
 _LEG_SPECS = (
     ("market", "市场主力资金流", "get_market_fund_flow"),
@@ -67,7 +68,7 @@ def shanghai_now(now=None):
 
 
 def resolve_as_of_date(as_of_date=None, now=None):
-    """顶层 as_of_date：YYYY-MM-DD。默认上海当日。"""
+    """顶层 as_of_date：快照请求日（上海日历），不是行情数据日。"""
     if as_of_date is None or str(as_of_date).strip() == "":
         return shanghai_now(now).date().isoformat()
     text = str(as_of_date).strip()
@@ -321,10 +322,23 @@ def build_saima_snapshot(
         "sector": fetch_sector or _default_fetcher(client, "get_sector_fund_flow"),
     }
 
+    from src.data.fetch import run_isolated
+
     frames = {}
     known_gaps = list(client_gaps)
+    # 与 Web 共用上游闸门；最多 2 worker，不靠加大 timeout。
+    fetched = run_isolated(
+        {
+            name: (lambda n=name, lab=label: _fetch_leg(lab, fetchers[n]))
+            for name, label, _method in _LEG_SPECS
+        }
+    )
     for name, label, _method in _LEG_SPECS:
-        frame, gaps = _fetch_leg(label, fetchers[name])
+        packed = fetched.get(name)
+        if isinstance(packed, tuple) and len(packed) == 2:
+            frame, gaps = packed
+        else:
+            frame, gaps = None, _leg_gaps(label, None, error="isolated fetch failed")
         frames[name] = frame
         known_gaps.extend(gaps)
 
@@ -332,6 +346,7 @@ def build_saima_snapshot(
         market_df=frames.get("market"),
         north_df=frames.get("north"),
         sector_rank=frames.get("sector"),
+        now=now,
     )
     native = to_jsonable(bias) or {}
     payload = {key: native.get(key) for key in NATIVE_BIAS_KEYS}
@@ -343,11 +358,13 @@ def build_saima_snapshot(
     if payload.get("score_delta") is None:
         payload["score_delta"] = 0
     payload["quality_ok"] = bool(payload.get("quality_ok"))
+    payload["insufficient"] = bool(native.get("insufficient") or not payload["quality_ok"])
 
-    usable = any(_leg_usable(frames.get(name)) for name, _label, _method in _LEG_SPECS)
-    if not usable:
+    usable_any = any(_leg_usable(frames.get(name)) for name, _label, _method in _LEG_SPECS)
+    if not usable_any:
         payload["quality_ok"] = False
         payload["score_delta"] = 0
+        payload["insufficient"] = True
 
     snapshot = {
         "as_of_date": as_of,
@@ -362,6 +379,7 @@ def build_saima_snapshot(
     latest = _latest_trade_date(frames.get("market"), frames.get("north"))
     if latest:
         snapshot["latest_trade_date"] = latest
+    # as_of_date 是快照请求日；行情日以 latest_trade_date / components.*.data_date 为准。
     return to_jsonable(snapshot)
 
 

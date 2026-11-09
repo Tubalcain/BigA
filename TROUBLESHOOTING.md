@@ -186,19 +186,19 @@ python examples/test_data_source.py
 ```
 不要把真实 token 写进 `config/config.yaml` 后提交。
 
-### 问题12：东方财富提示「IP 被临时限流」
-全市场快照 `stock_zh_a_spot_em` 分页多，短时间重复请求会被封 5–40 分钟。适配器**不会对限流再重试**，并回退到新浪 `stock_zh_a_spot`。等待恢复期间不要循环点「开始筛选」。
+### 问题12：东方财富超时 / 断连 / 启发式「临时限流」
+全市场快照 `stock_zh_a_spot_em` 与资金流 push2 分页多，容易 30s 超时或 `RemoteDisconnected`。AKShare 有时把断连包装成 `Push2RateLimitError`，**没有 HTTP 429/403/Retry-After 时不能确定是限流**。无 HTTP 码的「当前IP被临时限流」记 `rate_limit_heuristic`（不是 429），冷却且不立即重试；有 `RemoteDisconnected` cause 仍记 `disconnect`。超时不再叠加重试，同键在途不新开线程；**不能**杀掉第三方分页线程。上游闸门占用覆盖真实 worker 存活（超时返回后仍持有槽位直到线程结束），跨进程不同接口 label 共用东财总上限；进程退出由 OS 回收 flock。失败冷却写入独立 sidecar，跨进程在冷却期内不再打上游。真正观测到 HTTP 429 才按限流处理（含 HTTP-date Retry-After）；404 等 4xx 不重试。等待恢复期间不要循环刷新。缓存目录 `data/cache` 可删；过期命中会标明陈旧，且有最大年龄。
 
 ### 问题13：周末或停牌看不到实时价
-适配器会用最近一根 K 线收盘价兜底；`status=halted` 表示停牌。交易日历见 `get_trade_calendar()`。
+适配器会用最近一根 K 线收盘价兜底；`status=halted` 表示停牌。交易日历优先用已缓存的 `install_trade_calendar`；生产若没装外部日历，则用 `calendar.py` 的 bundled 上交所休市表（2024–2026 公告），**不是**国务院行政调休。未知年份只做周末休市 + 工作日近似，并标明 `weekday_fallback`，不假装官方。日频收盘后 90 分钟内允许上一完整交易日作为发布延迟暂用，过旧日期与陈旧缓存仍不计入投票。
 
 ### 问题14：资金流向是空表 / 只有部分板块
 东财个股与板块资金接口和全市场快照一样容易限流。适配器会：
 1. 写 `df.attrs['issues']`（页面 caption 能看到）
-2. 在 `fallback: true` 时试另一源
+2. 在 `fallback: true` 时：传输故障不打同源东财第二客户端；无 token / 积分或权限不足允许换客户端，但标 `same_upstream_degrade`，**不是独立备用**
 3. **不会**把沪深股通当日一行当成行业排名
 
-金额统一为 **万元**。TuShare 的行业/大盘资金（`moneyflow_ind_dc` / `moneyflow_mkt_dc`）常需较高积分，没权限时回退 AKShare。TuShare 行业/个股排名只有日频：选 5 日等周期时会空表或回退 AKShare，并把实际周期写进 `actual_period`，不会盖「5日」假章。概念/地域互相重叠，页面不会把板块加总冒充全市场。北向优先用 `moneyflow_hsgt`（TuShare）或东财沪深港通历史（AKShare）。不要对空表循环刷新。
+金额统一为 **万元**。TuShare 的行业/大盘资金（`moneyflow_ind_dc` / `moneyflow_mkt_dc`）常需较高积分：没权限或未配置 token 时可降级到 AKShare（同源，不是独立源）；超时/断连则不双打。TuShare 行业/个股排名只有日频：选 5 日等周期时会空表或按上一条规则降级，并把实际周期写进 `actual_period`，不会盖「5日」假章。概念/地域互相重叠，页面不会把板块加总冒充全市场。北向优先用 `moneyflow_hsgt`（TuShare）或东财沪深港通历史（AKShare）。不要对空表循环刷新。
 
 验证：
 

@@ -48,10 +48,16 @@ REQUIRED_NATIVE = (
 )
 
 
-def _series(values, col="main_net_inflow"):
+FROZEN_SESSION = datetime(2026, 11, 9, 10, 0, tzinfo=SHANGHAI)
+
+
+def _series(values, col="main_net_inflow", end=None):
+    from src.data.calendar import expected_daily_data_date
+
+    end = pd.Timestamp(end or expected_daily_data_date())
     return pd.DataFrame(
         {
-            "date": pd.date_range("2024-01-01", periods=len(values), freq="D"),
+            "date": pd.bdate_range(end=end, periods=len(values)),
             col: values,
         }
     )
@@ -129,6 +135,16 @@ class SaimaExportHelperTests(unittest.TestCase):
 
 
 class SaimaSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        from src.data.calendar import set_now_override
+
+        set_now_override(FROZEN_SESSION)
+
+    def tearDown(self):
+        from src.data.calendar import set_now_override
+
+        set_now_override(None)
+
     def test_three_legs_export_fields_json_and_leaders(self):
         now = datetime(2026, 11, 6, 17, 15, 0, tzinfo=SHANGHAI)
         snapshot = build_saima_snapshot(
@@ -163,7 +179,9 @@ class SaimaSnapshotTests(unittest.TestCase):
             snapshot["sector_leaders"],
             ["半导体", "软件开发", "银行", "有色金属", "煤炭"],
         )
-        self.assertEqual(snapshot["latest_trade_date"], "2024-01-06")
+        from src.data.calendar import expected_daily_data_date
+
+        self.assertEqual(snapshot["latest_trade_date"], expected_daily_data_date(now).isoformat())
         encoded = json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
         self.assertNotIn("NaN", encoded)
         self.assertNotIn("Infinity", encoded)
@@ -236,6 +254,31 @@ class SaimaSnapshotTests(unittest.TestCase):
         bad = _industry_rank()
         bad.attrs["ok"] = False
         self.assertEqual(extract_sector_leaders(bad), [])
+
+    def test_only_zero_north_export_is_insufficient(self):
+        north = _series([0, 0, 0, 0, 0, 0], col="net_inflow")
+        snapshot = build_saima_snapshot(
+            as_of_date="2026-11-09",
+            now=FROZEN_SESSION,
+            fetch_market=lambda: pd.DataFrame(),
+            fetch_north=lambda: north,
+            fetch_sector=lambda: pd.DataFrame(),
+        )
+        self.assertEqual(snapshot["as_of_date"], "2026-11-09")
+        self.assertEqual(snapshot["bias"], "中性")
+        self.assertFalse(snapshot["quality_ok"])
+        self.assertTrue(snapshot.get("insufficient"))
+        self.assertEqual(snapshot["score_delta"], 0)
+        self.assertEqual(snapshot["confidence"], 0)
+        from src.data.calendar import expected_daily_data_date
+
+        self.assertEqual(
+            snapshot["latest_trade_date"],
+            expected_daily_data_date(FROZEN_SESSION).isoformat(),
+        )
+        self.assertEqual(snapshot["latest_trade_date"], "2026-11-06")
+        self.assertNotEqual(snapshot["as_of_date"], snapshot["latest_trade_date"])
+        json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
 
 
 class SaimaCliTests(unittest.TestCase):

@@ -13,9 +13,19 @@ import pandas as pd
 
 from src.analysis.technical import TechnicalAnalyzer
 
-from .cache import get_cache, make_cache_key
+from .cache import bound_failure_ttl, bound_success_ttl, cached_load, get_cache, make_cache_key
+from .calendar import shanghai_now
 from .config import get_data_config
-from .fetch import DataFetchError, safe_fetch
+from .fetch import (
+    SAME_UPSTREAM_EASTMONEY,
+    DataFetchError,
+    infer_peer_reason,
+    last_fetch_diagnostic,
+    mark_same_upstream_degrade,
+    raise_if_cancelled,
+    safe_fetch,
+    same_upstream_peer_allowed,
+)
 from .quality import (
     attach_date_swap,
     compact_date,
@@ -97,6 +107,9 @@ class AKShareData:
     def _timeout(self):
         return int(self.source_cfg.timeout or 30)
 
+    def _budget(self):
+        return int(getattr(self.source_cfg, "retry_budget", 0) or 0) or None
+
     def _unavailable(self, factory):
         return factory("akshare", error="akshare unavailable", issues=["akshare unavailable"])
 
@@ -112,7 +125,11 @@ class AKShareData:
             logger.warning("TuShare 回退不可用: %s", exc)
             return None
 
-    def _try_peer(self, method, *args, **kwargs):
+    def _try_peer(self, method, *args, reason=None, frame=None, **kwargs):
+        reason = reason or infer_peer_reason(available=self.is_available(), frame=frame)
+        if not same_upstream_peer_allowed(method, reason):
+            logger.info("跳过同东财上游备用 %s（传输故障不双打，reason=%s）", method, reason)
+            return None
         other = self._peer()
         if other is None:
             return None
@@ -120,32 +137,64 @@ class AKShareData:
         if not callable(func):
             return None
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
         except Exception as exc:
             logger.warning("回退 %s 失败: %s", method, exc)
             return None
+        if method in SAME_UPSTREAM_EASTMONEY:
+            logger.info("同源东财降级 %s（reason=%s），不是独立备用", method, reason)
+            return mark_same_upstream_degrade(result, method)
+        return result
+
+    def _stamp_diag(self, value):
+        diag = last_fetch_diagnostic()
+        if value is None or diag is None or not hasattr(value, "attrs"):
+            return value
+        value.attrs["fetch_diagnostic"] = diag.as_dict()
+        issues = list(value.attrs.get("issues") or [])
+        issue = diag.as_issue()
+        if issue not in issues:
+            issues.append(issue)
+        value.attrs["issues"] = issues
+        return value
 
     def _fetch(self, func, default=None, label="", retries=None, timeout=None):
-        return safe_fetch(
+        raise_if_cancelled()
+        result = safe_fetch(
             func,
             retries=retries if retries is not None else self._retries(),
             timeout=self._timeout() if timeout is None else timeout,
             default=default,
             label=label,
+            budget=self._budget(),
+            upstream="eastmoney",
         )
+        if result is None or (isinstance(result, pd.DataFrame) and result.empty):
+            return self._stamp_diag(result)
+        return result
 
-    def _cached(self, key_parts, ttl, loader, default):
+    def _cached(self, key_parts, ttl, loader, default, kind="generic"):
         key = make_cache_key("AKShareData", *key_parts)
-        hit = self.cache.get(key)
-        if hit is not None:
-            return hit
-        value = loader()
-        if value is None:
-            value = default
-        # 空表也缓存一小段时间，避免雪崩打爆上游
-        cache_ttl = ttl if (isinstance(value, pd.DataFrame) and not value.empty) else min(ttl, 30)
-        self.cache.set(key, value, ttl=cache_ttl)
-        return value
+
+        def wrapped():
+            raise_if_cancelled()
+            value = loader()
+            if value is None:
+                value = default
+            if isinstance(value, pd.DataFrame) and value.empty:
+                return self._stamp_diag(value)
+            return value
+
+        return cached_load(
+            self.cache,
+            key,
+            wrapped,
+            default=default,
+            success_ttl=bound_success_ttl(ttl, kind=kind, cfg=self.config),
+            failure_ttl=bound_failure_ttl(self.config),
+            kind=kind,
+            source="akshare",
+        )
 
     def _fallback_history(self, code, start_date, end_date, period, adjust):
         df = self._try_peer(
@@ -201,23 +250,31 @@ class AKShareData:
                 issues=["akshare unavailable"],
             )
 
-        key = ("history", code, start, end, period_key, adj)
-        cache_key = make_cache_key("AKShareData", *key)
-        cached = self.cache.get(cache_key)
-        if cached is not None and validate_ohlcv(cached)[0]:
-            return cached
+        def loader():
+            try:
+                df = self._fetch_history(
+                    code, start, end, period_key, adj,
+                    filter_start=start_date, filter_end=end_date,
+                )
+            except Exception as exc:
+                logger.warning("AKShare 历史拉取异常 %s: %s", code, exc)
+                return empty_ohlcv("akshare", error=str(exc), issues=["fetch failed"])
+            ok, issues = validate_ohlcv(df)
+            if ok:
+                return df
+            if df is None:
+                return empty_ohlcv("akshare", issues=issues)
+            return df
 
-        try:
-            df = self._fetch_history(
-                code, start, end, period_key, adj,
-                filter_start=start_date, filter_end=end_date,
-            )
-        except Exception as exc:
-            logger.warning("AKShare 历史拉取异常 %s: %s", code, exc)
-            df = empty_ohlcv("akshare", error=str(exc), issues=["fetch failed"])
-        ok, issues = validate_ohlcv(df)
+        df = self._cached(
+            ("history", code, start, end, period_key, adj),
+            self.cache_ttl,
+            loader,
+            empty_ohlcv("akshare"),
+            kind="generic",
+        )
+        ok, issues = validate_ohlcv(df) if df is not None else (False, ["empty frame"])
         if ok:
-            self.cache.set(cache_key, df, ttl=self.cache_ttl)
             return attach_date_swap(df, swapped)
         if allow_fallback:
             fallback = self._fallback_history(code, start, end, period_key, adj)
@@ -246,6 +303,7 @@ class AKShareData:
 
         raw = None
         for kwargs in specs:
+            raise_if_cancelled()
             raw = self._fetch(
                 lambda kwargs=kwargs: ak.stock_zh_a_hist(**kwargs),
                 default=None,
@@ -283,6 +341,7 @@ class AKShareData:
                 ("stock_zh_a_spot_em", 1, 90),
                 ("stock_zh_a_spot", 1, 90),
             ):
+                raise_if_cancelled()
                 api = getattr(ak, api_name, None)
                 if api is None:
                     continue
@@ -297,7 +356,9 @@ class AKShareData:
             return self._unavailable(empty_quotes)
         if force:
             return loader()
-        return self._cached(("spot_snapshot",), self.ttl_realtime, loader, empty_quotes("akshare"))
+        return self._cached(
+            ("spot_snapshot",), self.ttl_realtime, loader, empty_quotes("akshare"), kind="realtime"
+        )
 
     def get_stock_list(self, exchange="所有", allow_fallback=True):
         """
@@ -324,7 +385,7 @@ class AKShareData:
                 return empty_list("akshare")
             return normalize_stock_list(raw, source="akshare")
 
-        df = self._cached(("stock_list",), self.ttl_list, loader, empty_list("akshare"))
+        df = self._cached(("stock_list",), self.ttl_list, loader, empty_list("akshare"), kind="list")
         if df is None or df.empty:
             if allow_fallback:
                 alt = self._try_peer("get_stock_list", exchange, allow_fallback=False)
@@ -375,8 +436,8 @@ class AKShareData:
 
         quote = self._cached(("quote", code), self.ttl_realtime, loader, empty_quotes("akshare"))
         if quote is None or quote.empty:
-            end = compact_date(pd.Timestamp.now())
-            start = compact_date(pd.Timestamp.now() - pd.Timedelta(days=14))
+            end = compact_date(shanghai_now())
+            start = compact_date(pd.Timestamp(shanghai_now()) - pd.Timedelta(days=14))
             hist = self.get_history_data(code, start, end, allow_fallback=True)
             if hist is not None and not hist.empty:
                 last = hist.iloc[[-1]]
@@ -586,6 +647,7 @@ class AKShareData:
             actual_period, actual_sector = period, sector
             seen = set()
             for try_period, try_sector in attempts:
+                raise_if_cancelled()
                 key = (try_period, try_sector)
                 if key in seen:
                     continue
@@ -617,6 +679,7 @@ class AKShareData:
             self.ttl_realtime,
             loader,
             empty_flow("akshare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer("get_sector_fund_flow", period, sector, allow_fallback=False)
@@ -671,6 +734,7 @@ class AKShareData:
             self.ttl_realtime,
             loader,
             empty_flow("akshare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer("get_stock_fund_flow_rank", period, allow_fallback=False)
@@ -735,6 +799,7 @@ class AKShareData:
             self.cache_ttl,
             loader,
             empty_stock_flow("akshare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer(
@@ -769,6 +834,7 @@ class AKShareData:
             ak = self._client()
             raw = None
             for api_name in ("stock_market_fund_flow", "stock_main_fund_flow"):
+                raise_if_cancelled()
                 api = getattr(ak, api_name, None)
                 if api is None:
                     continue
@@ -786,6 +852,7 @@ class AKShareData:
             self.cache_ttl,
             loader,
             empty_market_flow("akshare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer(
@@ -832,6 +899,7 @@ class AKShareData:
             self.cache_ttl,
             loader,
             empty_cross_border("akshare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer(
@@ -852,6 +920,7 @@ class AKShareData:
         used_api = None
         hist = getattr(ak, "stock_hsgt_hist_em", None)
         if hist is not None:
+            raise_if_cancelled()
             raw = self._fetch(
                 lambda: hist(symbol=symbol),
                 default=None,
@@ -865,6 +934,7 @@ class AKShareData:
                 ("stock_hsgt_north_net_flow_in_em", {}),
                 ("stock_hsgt_fund_flow_summary_em", {}),
             ):
+                raise_if_cancelled()
                 api = getattr(ak, api_name, None)
                 if api is None:
                     continue
@@ -969,7 +1039,7 @@ class AKShareData:
         return work.reset_index(drop=True)
 
     def is_trading_day(self, day=None):
-        day = pd.to_datetime(day or pd.Timestamp.now().normalize()).normalize()
+        day = pd.to_datetime(day or pd.Timestamp(shanghai_now()).normalize()).normalize()
         cal = self.get_trade_calendar()
         if cal is None or cal.empty:
             return bool(day.weekday() < 5)

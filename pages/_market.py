@@ -41,7 +41,7 @@ def _empty_reason(frame, fallback=""):
     return fallback
 
 
-def _show_empty(frame, fallback="接口暂时不可用（源站限流、字段变更或权限不足时会自动降级）。"):
+def _show_empty(frame, fallback="接口暂时不可用（超时、断连、空响应或权限不足时会降级）。"):
     st.info(fallback)
     reason = _empty_reason(frame)
     if reason:
@@ -59,8 +59,47 @@ def _render_fund_bias_card(bias):
     c1, c2 = st.columns(2)
     c1.metric("倾向", view["bias"])
     c2.metric("信心", view["confidence_label"], delta=view["confidence_pct"])
+    if view.get("insufficient") or not view.get("quality_ok"):
+        st.warning("数据不足：缺少可用的大盘主力或行业榜。倾向占位为中性、信心 0、评分贡献 0。")
+    else:
+        st.caption("质量：关键主数据可用")
+    for line in view.get("leg_date_captions") or []:
+        st.caption(line)
     for line in view["evidence"][:8]:
         st.caption("· " + line)
+
+
+def _cache_caption(frame, label):
+    if frame is None or not hasattr(frame, "attrs"):
+        return
+    from src.analysis.fund_flow import frame_data_date as _frame_data_date
+
+    source = frame.attrs.get("cache_source") or frame.attrs.get("source") or ""
+    hit = frame.attrs.get("cache_hit") or ""
+    fetched = frame.attrs.get("cache_fetched_at") or ""
+    data_date = _frame_data_date(frame)
+    bits = [label]
+    if source:
+        bits.append(f"来源 {source}")
+    if data_date:
+        bits.append(f"数据日期 {data_date}")
+    from src.analysis.fund_flow import evidence_fresh
+
+    _fresh, why = evidence_fresh(frame)
+    if why == "publish_delay":
+        bits.append("收盘发布延迟，上一完整交易日暂用")
+    elif why == "stale_data_date":
+        bits.append("数据日期过旧，拒绝计入")
+    elif why == "future_date":
+        bits.append("未来日期，拒绝计入")
+    if frame.attrs.get("cache_stale") or why == "stale_cache":
+        bits.append(f"过期缓存（{fetched or '未知时间'}），不是新鲜数据")
+    elif hit:
+        bits.append(f"缓存 {hit}")
+        if fetched:
+            bits.append(f"抓取 {fetched}")
+    if len(bits) > 1:
+        st.caption(" · ".join(bits))
 
 
 def _flow_table(df, extra=None, rows=20):
@@ -188,7 +227,7 @@ with tab2:
 
 with tab3:
     st.subheader("💰 资金流向")
-    st.caption("金额已统一为万元。主力 ≈ 超大单 + 大单；小单近似散户。顶部「资金面倾向」是 1–5 日方向，不是涨跌预测。源站限流或积分不足时会空表降级并标明原因。")
+    st.caption("金额已统一为万元。主力 ≈ 超大单 + 大单；小单近似散户。顶部「资金面倾向」是 1–5 日方向，不是涨跌预测。超时、断连、空响应或权限不足时会空表降级并标明原因，不把启发式限流文案当成已证实的 HTTP 429。")
 
     ctrl1, ctrl2, ctrl3 = st.columns(3)
     with ctrl1:
@@ -219,11 +258,24 @@ with tab3:
         chart_gen = PlotlyChartGenerator()
 
         with st.spinner("正在获取资金流向..."):
-            sector = ak_data.get_sector_fund_flow(indicator=period, sector_type=sector_kind)
-            stock_rank = ak_data.get_stock_fund_flow_rank(indicator=period)
-            market_flow = ak_data.get_market_fund_flow()
-            north = ak_data.get_northbound_flow()
-            boards = ak_data.get_industry_boards()
+            from src.data.fetch import run_isolated
+
+            fetched = run_isolated(
+                {
+                    "sector": lambda: ak_data.get_sector_fund_flow(
+                        indicator=period, sector_type=sector_kind
+                    ),
+                    "stock_rank": lambda: ak_data.get_stock_fund_flow_rank(indicator=period),
+                    "market": lambda: ak_data.get_market_fund_flow(),
+                    "north": lambda: ak_data.get_northbound_flow(),
+                    "boards": lambda: ak_data.get_industry_boards(),
+                }
+            )
+            sector = fetched.get("sector")
+            stock_rank = fetched.get("stock_rank")
+            market_flow = fetched.get("market")
+            north = fetched.get("north")
+            boards = fetched.get("boards")
 
         sector = enrich_sector_flow(sector, boards)
 
@@ -233,6 +285,9 @@ with tab3:
             sector_rank=sector,
         )
         _render_fund_bias_card(market_bias)
+        _cache_caption(market_flow, "市场主力")
+        _cache_caption(sector, "板块榜")
+        _cache_caption(north, "北向")
         st.markdown("---")
 
         st.markdown("#### 市场资金")
@@ -339,4 +394,13 @@ with tab3:
 
 # 页脚
 st.markdown("---")
-st.caption(f"数据来源: AKShare / TuShare 回退 | 更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+try:
+    from src.data.calendar import shanghai_now as _shanghai_now
+
+    _now_label = _shanghai_now().strftime("%Y-%m-%d %H:%M:%S")
+except Exception:
+    _now_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+st.caption(
+    f"数据来源: AKShare / TuShare（东财 *_dc 不是独立备用） | 页面刷新 {_now_label} Asia/Shanghai；"
+    "行情日见各腿数据日期，as_of 不是今日行情。"
+)

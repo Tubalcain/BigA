@@ -12,9 +12,20 @@ import logging
 
 import pandas as pd
 
-from .cache import get_cache, make_cache_key
+from .cache import bound_failure_ttl, bound_success_ttl, cached_load, get_cache, make_cache_key
+from .calendar import shanghai_now
 from .config import get_data_config
-from .fetch import DataFetchError, safe_fetch
+from .fetch import (
+    SAME_UPSTREAM_EASTMONEY,
+    DataFetchError,
+    infer_peer_reason,
+    last_fetch_diagnostic,
+    mark_same_upstream_degrade,
+    raise_if_cancelled,
+    redact_text,
+    safe_fetch,
+    same_upstream_peer_allowed,
+)
 from .quality import (
     attach_date_swap,
     compact_date,
@@ -84,7 +95,7 @@ class TuShareData:
         except Exception as exc:
             self._init_error = exc
             self._pro = None
-            logger.warning("TuShare 初始化失败: %s", exc)
+            logger.warning("TuShare 初始化失败: %s", redact_text(exc))
 
     def is_available(self):
         return bool(self.source_cfg.enabled and self.token and self._pro is not None)
@@ -95,31 +106,63 @@ class TuShareData:
     def _timeout(self):
         return int(self.source_cfg.timeout or 30)
 
+    def _budget(self):
+        return int(getattr(self.source_cfg, "retry_budget", 0) or 0) or None
+
+    def _stamp_diag(self, value):
+        diag = last_fetch_diagnostic()
+        if value is None or diag is None or not hasattr(value, "attrs"):
+            return value
+        value.attrs["fetch_diagnostic"] = diag.as_dict()
+        issues = list(value.attrs.get("issues") or [])
+        issue = diag.as_issue()
+        if issue not in issues:
+            issues.append(issue)
+        value.attrs["issues"] = issues
+        return value
+
     def _fetch(self, func, default=None, label=""):
-        return safe_fetch(
+        raise_if_cancelled()
+        result = safe_fetch(
             func,
             retries=self._retries(),
             timeout=self._timeout(),
             default=default,
             label=label,
+            budget=self._budget(),
+            upstream="tushare",
         )
+        if result is None or (isinstance(result, pd.DataFrame) and result.empty):
+            return self._stamp_diag(result)
+        return result
 
-    def _cached(self, key_parts, ttl, loader, default):
+    def _cached(self, key_parts, ttl, loader, default, kind="generic"):
         key = make_cache_key("TuShareData", *key_parts)
-        hit = self.cache.get(key)
-        if hit is not None:
-            return hit
-        value = loader()
-        if value is None:
-            value = default
-        cache_ttl = ttl if (isinstance(value, pd.DataFrame) and not value.empty) else min(ttl, 30)
-        self.cache.set(key, value, ttl=cache_ttl)
-        return value
+
+        def wrapped():
+            raise_if_cancelled()
+            value = loader()
+            if value is None:
+                value = default
+            if isinstance(value, pd.DataFrame) and value.empty:
+                return self._stamp_diag(value)
+            return value
+
+        return cached_load(
+            self.cache,
+            key,
+            wrapped,
+            default=default,
+            success_ttl=bound_success_ttl(ttl, kind=kind, cfg=self.config),
+            failure_ttl=bound_failure_ttl(self.config),
+            kind=kind,
+            source="tushare",
+        )
 
     def _require(self):
         if not self.is_available():
             reason = "未配置 TUSHARE_TOKEN" if not self.token else (self._init_error or "TuShare 不可用")
-            raise DataFetchError(str(reason))
+            raise DataFetchError(redact_text(reason))
 
     def _peer(self):
         if not self.config.fallback:
@@ -133,7 +176,15 @@ class TuShareData:
             logger.warning("AKShare 回退不可用: %s", exc)
             return None
 
-    def _try_peer(self, method, *args, **kwargs):
+    def _try_peer(self, method, *args, reason=None, frame=None, **kwargs):
+        reason = reason or infer_peer_reason(
+            available=self.is_available(),
+            has_token=bool(self.token),
+            frame=frame,
+        )
+        if not same_upstream_peer_allowed(method, reason):
+            logger.info("跳过同东财上游备用 %s（传输故障不双打，reason=%s）", method, reason)
+            return None
         other = self._peer()
         if other is None:
             return None
@@ -141,10 +192,14 @@ class TuShareData:
         if not callable(func):
             return None
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
         except Exception as exc:
             logger.warning("回退 %s 失败: %s", method, exc)
             return None
+        if method in SAME_UPSTREAM_EASTMONEY:
+            logger.info("同源东财降级 %s（reason=%s），不是独立备用", method, reason)
+            return mark_same_upstream_degrade(result, method)
+        return result
 
     def _fallback_history(self, code, start_date, end_date, period, adjust):
         df = self._try_peer(
@@ -391,8 +446,8 @@ class TuShareData:
             return empty_quotes("tushare", error="tushare unavailable", issues=["tushare unavailable"])
 
         def loader():
-            end = pd.Timestamp.now().strftime("%Y%m%d")
-            start = (pd.Timestamp.now() - pd.Timedelta(days=14)).strftime("%Y%m%d")
+            end = shanghai_now().strftime("%Y%m%d")
+            start = (shanghai_now() - pd.Timedelta(days=14)).strftime("%Y%m%d")
             bars = self.get_daily_data(code, start, end, period="daily")
             if bars is None or bars.empty:
                 return empty_quotes("tushare")
@@ -513,8 +568,8 @@ class TuShareData:
                 "000688.SH": "科创50",
                 "000300.SH": "沪深300",
             }
-            end = pd.Timestamp.now().strftime("%Y%m%d")
-            start = (pd.Timestamp.now() - pd.Timedelta(days=10)).strftime("%Y%m%d")
+            end = shanghai_now().strftime("%Y%m%d")
+            start = (shanghai_now() - pd.Timedelta(days=10)).strftime("%Y%m%d")
             rows = []
             api = getattr(self._pro, "index_daily", None)
             if api is None:
@@ -626,6 +681,7 @@ class TuShareData:
             self.ttl_realtime,
             loader,
             empty_flow("tushare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer("get_sector_fund_flow", period, sector, allow_fallback=False)
@@ -681,6 +737,7 @@ class TuShareData:
             self.ttl_realtime,
             loader,
             empty_flow("tushare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer("get_stock_fund_flow_rank", period, allow_fallback=False)
@@ -742,6 +799,7 @@ class TuShareData:
             self.cache_ttl,
             loader,
             empty_stock_flow("tushare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer(
@@ -792,10 +850,15 @@ class TuShareData:
             self.cache_ttl,
             loader,
             empty_market_flow("tushare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer(
-                "get_market_fund_flow", start or None, end or None, allow_fallback=False
+                "get_market_fund_flow",
+                start or None,
+                end or None,
+                allow_fallback=False,
+                frame=result,
             )
             if alt is not None and not alt.empty:
                 return attach_date_swap(alt, swapped)
@@ -810,9 +873,9 @@ class TuShareData:
         """沪深股通 moneyflow_hsgt。金额：接口为百万，输出万元。"""
         start, end, swapped = ordered_date_range(start_date, end_date)
         if not start:
-            start = (pd.Timestamp.now() - pd.Timedelta(days=180)).strftime("%Y%m%d")
+            start = (pd.Timestamp(shanghai_now()) - pd.Timedelta(days=180)).strftime("%Y%m%d")
         if not end:
-            end = pd.Timestamp.now().strftime("%Y%m%d")
+            end = shanghai_now().strftime("%Y%m%d")
         if not self.is_available():
             if allow_fallback:
                 alt = self._try_peer(
@@ -847,6 +910,7 @@ class TuShareData:
             self.cache_ttl,
             loader,
             empty_cross_border("tushare"),
+            kind="flow",
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer("get_cross_border_flow", start, end, allow_fallback=False)
@@ -893,8 +957,8 @@ class TuShareData:
         return dict(zip(listed["code"], listed["name"]))
 
     def get_trade_calendar(self, start_date=None, end_date=None):
-        start = compact_date(start_date) or (pd.Timestamp.now() - pd.Timedelta(days=365)).strftime("%Y%m%d")
-        end = compact_date(end_date) or (pd.Timestamp.now() + pd.Timedelta(days=30)).strftime("%Y%m%d")
+        start = compact_date(start_date) or (pd.Timestamp(shanghai_now()) - pd.Timedelta(days=365)).strftime("%Y%m%d")
+        end = compact_date(end_date) or (pd.Timestamp(shanghai_now()) + pd.Timedelta(days=30)).strftime("%Y%m%d")
 
         def loader():
             if not self.is_available():
@@ -918,7 +982,7 @@ class TuShareData:
         return self._cached(("trade_calendar", start, end), self.ttl_calendar, loader, stamp_frame(pd.DataFrame(columns=["date", "is_open"]), "tushare"))
 
     def is_trading_day(self, day=None):
-        day = pd.to_datetime(day or pd.Timestamp.now().normalize()).normalize()
+        day = pd.to_datetime(day or pd.Timestamp(shanghai_now()).normalize()).normalize()
         cal = self.get_trade_calendar(
             (day - pd.Timedelta(days=10)).strftime("%Y%m%d"),
             (day + pd.Timedelta(days=10)).strftime("%Y%m%d"),
@@ -954,8 +1018,8 @@ class TuShareData:
         return self._cached(("halted",), self.ttl_realtime, loader, empty_list("tushare"))
 
     def _latest_open_date(self):
-        end = pd.Timestamp.now().strftime("%Y%m%d")
-        start = (pd.Timestamp.now() - pd.Timedelta(days=14)).strftime("%Y%m%d")
+        end = shanghai_now().strftime("%Y%m%d")
+        start = (pd.Timestamp(shanghai_now()) - pd.Timedelta(days=14)).strftime("%Y%m%d")
         cal = self.get_trade_calendar(start, end)
         if cal is None or cal.empty or "is_open" not in cal.columns:
             return end
