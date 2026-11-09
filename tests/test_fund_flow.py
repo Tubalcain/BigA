@@ -364,10 +364,18 @@ class FlowAnalysisTests(unittest.TestCase):
 
 
 class FlowBiasTests(unittest.TestCase):
+    def _end(self):
+        from src.data.calendar import expected_daily_data_date
+
+        return pd.Timestamp(expected_daily_data_date())
+
+    def _dates(self, n):
+        return pd.bdate_range(end=self._end(), periods=n)
+
     def _series(self, values, col="main_net_inflow"):
         return pd.DataFrame(
             {
-                "date": pd.date_range("2024-01-01", periods=len(values), freq="D"),
+                "date": self._dates(len(values)),
                 col: values,
             }
         )
@@ -462,7 +470,7 @@ class FlowBiasTests(unittest.TestCase):
         self.assertTrue(_divergence_conflicts("价涨资出", stock_sign=1, vote_signs=[1]))
         self.assertFalse(_divergence_conflicts("价涨资出", stock_sign=-1, vote_signs=[-1]))
         self.assertTrue(_divergence_conflicts("价跌资进", stock_sign=-1, vote_signs=[-1]))
-        dates = pd.date_range("2024-01-01", periods=8, freq="D")
+        dates = self._dates(8)
         price = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
         stock = pd.DataFrame({"date": dates, "main_net_inflow": [100, 80, -50, -80, -90, -100, -120, -150]})
         market = self._series([80, 90, 100, 110, 120, 130, 140, 150])
@@ -538,7 +546,7 @@ class FlowBiasTests(unittest.TestCase):
         self.assertEqual(down["blended_action"], "HOLD")
 
     def test_bad_stock_skips_divergence(self):
-        dates = pd.date_range("2024-01-01", periods=8, freq="D")
+        dates = self._dates(8)
         price = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
         stock = pd.DataFrame({"date": dates, "main_net_inflow": [100, 80, -50, -80, -90, -100, -120, -150]})
         stock.attrs["quality"] = {"ok": False}
@@ -568,7 +576,7 @@ class FlowBiasTests(unittest.TestCase):
         market = self._series([80, 90, 100, 110, 120, 130])
         north = self._series([50, 60, 70, 80, 90, 100], col="net_inflow")
         stock = self._series([20, 30, 40, 50, 60, 70])
-        dates = pd.date_range("2024-01-01", periods=6, freq="D")
+        dates = self._dates(6)
         price = pd.DataFrame({"date": dates, "close": [10, 10.1, 10.2, 10.3, 10.4, 10.5]})
         analysis_page = stock_fund_bias(
             stock_flow=stock, price_df=price, market_df=market, north_df=north
@@ -609,7 +617,7 @@ class FlowBiasTests(unittest.TestCase):
         self.assertIn("重叠", region_label)
 
     def test_ohlcv_issues_without_ok_skip_divergence(self):
-        dates = pd.date_range("2024-01-01", periods=8, freq="D")
+        dates = self._dates(8)
         price = pd.DataFrame({"date": dates, "close": [10, 10.2, 10.5, 11, 11.4, 11.8, 12.2, 12.6]})
         price.attrs["issues"] = ["high < low", "invalid close"]
         stock = pd.DataFrame({"date": dates, "main_net_inflow": [100, 80, -50, -80, -90, -100, -120, -150]})
@@ -635,11 +643,12 @@ class FlowBiasTests(unittest.TestCase):
         self.assertTrue(bias.get("insufficient"))
         self.assertEqual(bias["confidence"], 0)
         self.assertEqual(bias["score_delta"], 0)
-        self.assertEqual(bias["components"]["north"]["data_date"], "2024-01-06")
+        expected = self._end().strftime("%Y-%m-%d")
+        self.assertEqual(bias["components"]["north"]["data_date"], expected)
         view = bias_display(bias)
         self.assertFalse(view["quality_ok"])
         self.assertTrue(view["insufficient"])
-        self.assertTrue(any("2024-01-06" in line for line in view["leg_date_captions"]))
+        self.assertTrue(any(expected in line for line in view["leg_date_captions"]))
 
     def test_valid_primary_neutral_is_not_insufficient(self):
         market = self._series([1, -1, 1, -1, 1, 0])
@@ -649,7 +658,7 @@ class FlowBiasTests(unittest.TestCase):
         self.assertFalse(bias.get("insufficient"))
         self.assertEqual(bias["score_delta"], 0)
         self.assertTrue(bias["components"]["market"]["available"])
-        self.assertEqual(bias["components"]["market"]["data_date"], "2024-01-06")
+        self.assertEqual(bias["components"]["market"]["data_date"], self._end().strftime("%Y-%m-%d"))
 
     def test_market_bad_leg_keeps_industry_primary(self):
         market = self._series([80, 90, 100, 110, 120, 130])
@@ -662,6 +671,46 @@ class FlowBiasTests(unittest.TestCase):
         self.assertTrue(bias["quality_ok"])
         self.assertEqual(bias["bias"], "偏多")
         self.assertGreater(bias["score_delta"], 0)
+
+    def test_stale_cache_and_future_dates_do_not_vote(self):
+        stale = self._series([80, 90, 100, 110, 120, 130])
+        stale.attrs["cache_stale"] = True
+        stale.attrs["issues"] = ["stale_cache"]
+        stale.attrs["cache_source"] = "akshare"
+        stale.attrs["cache_fetched_at"] = "2026-10-01T00:00:00+00:00"
+        bias = market_fund_bias(market_df=stale)
+        self.assertFalse(bias["quality_ok"])
+        self.assertIn("market", bias.get("dropped_legs") or [])
+        self.assertEqual(bias["bias"], "中性")
+        view = bias_display(bias)
+        self.assertTrue(any("来源 akshare" in line or "陈旧缓存" in line for line in view["leg_date_captions"]))
+
+        future = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2099-01-06"] * 6),
+                "main_net_inflow": [200, 210, 220, 230, 240, 250],
+            }
+        )
+        future_bias = market_fund_bias(market_df=future)
+        self.assertFalse(future_bias["quality_ok"])
+        self.assertIn("market", future_bias.get("dropped_legs") or [])
+
+        october = pd.DataFrame(
+            {
+                "date": pd.bdate_range("2026-10-08", periods=6),
+                "main_net_inflow": [80, 90, 100, 110, 120, 130],
+            }
+        )
+        oct_bias = market_fund_bias(market_df=october)
+        self.assertFalse(oct_bias["quality_ok"])
+        self.assertEqual(oct_bias["bias"], "中性")
+
+    def test_valid_primary_neutral_not_killed_by_freshness(self):
+        market = self._series([1, -1, 1, -1, 1, 0])
+        bias = market_fund_bias(market_df=market)
+        self.assertTrue(bias["quality_ok"])
+        self.assertFalse(bias.get("insufficient"))
+        self.assertEqual(bias["bias"], "中性")
 
 
 class FlowAdapterEmptyTests(unittest.TestCase):

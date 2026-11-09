@@ -322,24 +322,25 @@ def build_saima_snapshot(
         "sector": fetch_sector or _default_fetcher(client, "get_sector_fund_flow"),
     }
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from src.data.fetch import run_isolated
 
     frames = {}
     known_gaps = list(client_gaps)
-    # 三腿并行、超时隔离：一条腿卡住不阻塞另外两条开工。
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futs = {
-            pool.submit(_fetch_leg, label, fetchers[name]): (name, label)
+    # 与 Web 共用上游闸门；最多 2 worker，不靠加大 timeout。
+    fetched = run_isolated(
+        {
+            name: (lambda n=name, lab=label: _fetch_leg(lab, fetchers[n]))
             for name, label, _method in _LEG_SPECS
         }
-        for fut in as_completed(futs):
-            name, label = futs[fut]
-            try:
-                frame, gaps = fut.result()
-            except Exception as exc:
-                frame, gaps = None, _leg_gaps(label, None, error=exc)
-            frames[name] = frame
-            known_gaps.extend(gaps)
+    )
+    for name, label, _method in _LEG_SPECS:
+        packed = fetched.get(name)
+        if isinstance(packed, tuple) and len(packed) == 2:
+            frame, gaps = packed
+        else:
+            frame, gaps = None, _leg_gaps(label, None, error="isolated fetch failed")
+        frames[name] = frame
+        known_gaps.extend(gaps)
 
     bias = market_fund_bias(
         market_df=frames.get("market"),

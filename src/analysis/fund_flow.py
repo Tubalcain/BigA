@@ -13,7 +13,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from src.data.calendar import expected_daily_data_date, format_leg_date_caption
+from src.data.calendar import expected_daily_data_date, format_leg_date_caption, shanghai_today
 from src.data.quality import _ok_from_flow_issues, _ok_from_ohlcv_issues, sector_type_short
 
 
@@ -88,6 +88,18 @@ def unit_caption(df, fallback_source="", requested_period=None, requested_sector
             parts.append(f"请求周期: {requested_p}")
     if sector:
         parts.append(f"板块: {sector}")
+    data_date = _frame_data_date(df)
+    if data_date:
+        parts.append(format_leg_date_caption(data_date))
+    cache_source = df.attrs.get("cache_source")
+    if cache_source:
+        parts.append(f"缓存来源: {cache_source}")
+    hit = df.attrs.get("cache_hit")
+    if hit:
+        parts.append(f"缓存: {hit}")
+    if df.attrs.get("cache_stale"):
+        fetched = df.attrs.get("cache_fetched_at") or ""
+        parts.append("陈旧缓存" + (f" {fetched}" if fetched else ""))
     return " | ".join(parts)
 
 
@@ -541,8 +553,37 @@ def attach_leg_dates(components, frames):
     for name, df in frames:
         if name not in components:
             continue
-        components[name].setdefault("data_date", _frame_data_date(df))
+        item = components[name]
+        item.setdefault("data_date", _frame_data_date(df))
+        if df is None or not hasattr(df, "attrs"):
+            continue
+        item.setdefault("cache_source", df.attrs.get("cache_source") or df.attrs.get("source"))
+        item.setdefault("cache_hit", df.attrs.get("cache_hit"))
+        item.setdefault("cache_stale", bool(df.attrs.get("cache_stale")))
+        item.setdefault("cache_fetched_at", df.attrs.get("cache_fetched_at"))
     return components
+
+
+def evidence_fresh(df, now=None):
+    """
+    日频允许上一真实交易日；陈旧缓存可展示但不算新证据；未来日期拒绝。
+    无日期的排名表只看 cache_stale。
+    """
+    if df is None or getattr(df, "empty", True):
+        return True, None
+    issues = _collect_frame_issues(df)
+    if df.attrs.get("cache_stale") or any("stale_cache" in str(item) for item in issues):
+        return False, "stale_cache"
+    data_date = _frame_data_date(df)
+    if data_date is None:
+        return True, None
+    today = shanghai_today(now).isoformat()
+    if data_date > today:
+        return False, "future_date"
+    expected = expected_daily_data_date(now).isoformat()
+    if data_date < expected:
+        return False, "stale_data_date"
+    return True, None
 
 
 def _collect_frame_issues(df):
@@ -583,6 +624,9 @@ def _frame_quality_ok(df):
 def frame_quality_ok(df):
     """公开质量门控，页面展示与分析层同一套判定。"""
     return _frame_quality_ok(df)
+
+
+frame_data_date = _frame_data_date
 
 
 def empty_fund_bias(reason="资金数据不足，不下倾向"):
@@ -814,6 +858,17 @@ def fund_flow_bias(
             components[name] = _leg_component(available=True, quality_ok=False)
             evidence.append(f"{_LEG_CN.get(name, name)}数据质量不足，该腿不计入")
             return False
+        fresh, why = evidence_fresh(df)
+        if not fresh:
+            dropped_legs.append(name)
+            components[name] = _leg_component(available=True, quality_ok=False, freshness=why)
+            label = {
+                "stale_cache": "陈旧缓存仅供展示，不作为有效新证据",
+                "future_date": "未来日期，拒绝计入",
+                "stale_data_date": "数据日期早于上一交易日，不作为有效新证据",
+            }.get(why, "时效不足，不计入")
+            evidence.append(f"{_LEG_CN.get(name, name)}{label}")
+            return False
         return True
 
     if _take("market", market_df):
@@ -1034,8 +1089,19 @@ def bias_display(bias):
     for name in ("market", "north", "sector", "stock"):
         item = components.get(name) or {}
         date = item.get("data_date")
+        source = item.get("cache_source")
+        parts = []
         if date:
-            dates.append(f"{_LEG_CN.get(name, name)} {format_leg_date_caption(date)}")
+            parts.append(format_leg_date_caption(date))
+        if source:
+            parts.append(f"来源 {source}")
+        if item.get("cache_stale") or item.get("cache_hit") in ("stale", "failure", "cooldown"):
+            fetched = item.get("cache_fetched_at") or ""
+            parts.append("陈旧缓存" + (f"（{fetched}）" if fetched else ""))
+        elif item.get("cache_hit"):
+            parts.append(f"缓存 {item.get('cache_hit')}")
+        if parts:
+            dates.append(f"{_LEG_CN.get(name, name)} " + " · ".join(parts))
     quality_ok = bool(payload.get("quality_ok"))
     insufficient = bool(payload.get("insufficient") or not quality_ok)
     return {

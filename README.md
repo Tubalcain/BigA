@@ -32,10 +32,10 @@
 - 中英列名映射到同一套英文 schema；报价丢掉未知列和空/非法代码。
 - 日期为 **Asia/Shanghai 日历日**（naive midnight）；`2024-1-2` / `2024/01/02` 会收成 `YYYYMMDD`；起止颠倒会**先交换再请求上游**，并标记 `date_range_swapped`。
 - 去重、丢弃缺 OHLC 的 bar、把 high/low 钳到包含 open/close，标记 `is_outlier`；页面会提示异常 K 线数量。
-- 空态可用 `describe_data_problems(df)` 收成一行给 UI；源切换用 `source_switch_note`。Web/CLI 共享 `data/cache` 持久缓存（按源/参数/上海时段分段），并发请求合并；成功 TTL 有上限且盘中走短 TTL，失败短冷却，**不会同日永久缓存**。过期缓存若被拿来垫底会标 `stale_cache` / 来源 / 抓取时间，不得冒充新鲜数据。超时立刻返回且**不再叠加重试**（避免后台分页继续打接口）；断连才有界退避+抖动，总时间受 `retry_budget` 约束。真正的 HTTP 429 才按限流处理并尊重 `Retry-After`；取不到 HTTP 状态码记 `unknown`。AKShare `Push2RateLimitError` 是上游启发式包装，**不是**已证实的 429。
+- 空态可用 `describe_data_problems(df)` 收成一行给 UI；源切换用 `source_switch_note`。Web/CLI 共享 `data/cache`（JSON，不反序列化 pickle）。逻辑键按源/参数，**不把上海时段写进键**，以便跨日回退最后好数据；TTL 仍按盘中缩短。失败冷却与好数据分离：空表或异常不会覆盖最后好缓存，失败命中 `fresh=False`，陈旧回退有最大年龄。跨进程用 flock，锁等待有上限，owner 崩溃由 OS 释放；挂起的 owner 不会永久堵住。超时立刻返回且**不再叠加重试**；同键在途拒绝再开线程。**不能**强制杀掉 AKShare 分页线程（daemon，进程退出不等待）。断连/5xx 才有界退避，总时间受 `retry_budget` 约束。真正的 HTTP 429 才按限流并尊重 `Retry-After`（数字或 HTTP-date）；4xx 不重试。无 HTTP 码的 `Push2RateLimitError`（「当前IP被临时限流」）记 `rate_limit_heuristic`，**不是** 429，冷却且不立即重试；有 `RemoteDisconnected` cause 仍记 `disconnect`。东财上游全进程最多约 2 路并发（Web/CLI 尽量共用闸门），不靠加大 timeout。
 - 资金流：东财排名按元、HSGT 历史按万、TuShare HSGT 按百万换算为万元；`auto` 只作兜底并做量级校验。周期/板块回退会写入 `actual_period` / `actual_sector` 和 `period_fallback:5日→今日` 这类 issues，UI 展示实际值。TuShare 行业/个股排名只有日频，多日请求会空表，不会盖请求周期的假章。概念/地域互相重叠，合计不当作全市场。分析在 `src/analysis/fund_flow.py`（排名、主力 vs 散户、趋势、价资背离、`market_fund_bias` / `stock_fund_bias` 短周期倾向）。倾向是 1–5 日方向，不是涨跌预测。个股分析页与交易决策页共用个股级输入（个股资金、价资、市场主力、北向）。坏腿只剔除该腿；不合格个股表不算价资背离。`apply_fund_flow_bias` 只记软参考分，**不改**技术面买卖动作。
-- 市场级 `quality_ok`：需要至少一条可用的**关键主数据**（大盘主力，或非重叠行业榜）。有效主腿中性仍是中性、不是数据不足。缺主数据且只剩北向零净额/mixed 时为 **insufficient**（`quality_ok=false`、`confidence=0`、`score_delta=0`），UI 与 Saima 导出一致。各腿展示 Asia/Shanghai 真实数据日期；日频盘中/周末用上一交易日合理，**不要把 `as_of_date` 当成今日行情**。
-- TuShare 备用限制：`moneyflow_ind_dc` / `moneyflow_mkt_dc` 与 AKShare 东财 push2 **同一上游**，不再当作独立备用（避免双倍打东财）。北向 `moneyflow_hsgt` 在配置了 `TUSHARE_TOKEN` 且账号有权限时才是独立源；无 token 时如实等待配置，不阻塞其它修复。积分/权限不足不会假装有数据，也不会发明第三源或承诺上游恢复。OpenBB 未接入。
+- 市场级 `quality_ok`：需要至少一条可用的**关键主数据**（大盘主力，或非重叠行业榜）。有效主腿中性仍是中性、不是数据不足。缺主数据且只剩北向零净额/mixed 时为 **insufficient**。陈旧缓存/未来日期/早于上一交易日的日频不计入投票（仍可展示来源日期）。交易日历缺省用内置休市表 fallback，**不**在 `calendar.py` 拉网。各腿展示 Asia/Shanghai 真实数据日期与缓存来源；**不要把 `as_of_date` 当成今日行情**。
+- TuShare 备用限制：`moneyflow_ind_dc` / `moneyflow_mkt_dc` 与 AKShare 东财 push2 **同一上游**。传输故障（超时/断连）拒绝备用，避免双打。积分不足、无 token、权限错误允许换客户端降级，但会标 `same_upstream_degrade:eastmoney`，**不是独立源**。北向 `moneyflow_hsgt` 在配置了 `TUSHARE_TOKEN` 且账号有权限时才是独立源。不会发明第三源或因 mock 通过而承诺上游恢复。OpenBB 未接入。
 
 ## 快速开始
 

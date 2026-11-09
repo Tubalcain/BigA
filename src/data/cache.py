@@ -1,4 +1,4 @@
-"""Web/CLI 共享的 TTL 缓存：内存 + 可选磁盘，并发合并，失败冷却，过期可标陈旧。"""
+"""Web/CLI 共享的 TTL 缓存：内存 + JSON 磁盘，跨进程合并，失败冷却与好数据分离。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import pickle
 import tempfile
 import threading
 import time
@@ -20,7 +19,8 @@ from .config import cache_dir, get_data_config
 
 logger = logging.getLogger("biga.data.cache")
 
-CACHE_FORMAT = 1
+CACHE_FORMAT = 2
+CACHE_MAGIC = b"BIGAJSON1\n"
 _CACHE = None
 _CACHE_LOCK = threading.Lock()
 
@@ -85,15 +85,85 @@ def stamp_cache_meta(
         work.attrs.setdefault("source", source)
     if session:
         work.attrs["cache_session"] = session
+    if stale or hit in ("failure", "cooldown"):
+        work.attrs["fresh"] = False
     if stale:
         issues = list(work.attrs.get("issues") or [])
         if "stale_cache" not in issues:
             issues.append("stale_cache")
         work.attrs["issues"] = issues
-        work.attrs["fresh"] = False
+    elif hit in ("fresh", "coalesced", "miss"):
+        work.attrs.setdefault("fresh", True)
     else:
-        work.attrs.setdefault("fresh", hit in ("fresh", "coalesced", "miss"))
+        work.attrs.setdefault("fresh", False)
     return work
+
+
+def _jsonable(obj, depth=0):
+    if depth > 8:
+        return str(obj)
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            try:
+                out[str(key)] = _jsonable(value, depth + 1)
+            except TypeError:
+                out[str(key)] = str(value)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(item, depth + 1) for item in obj]
+    return str(obj)
+
+
+def encode_cache_value(value):
+    try:
+        import pandas as pd
+    except ImportError:  # pragma: no cover
+        pd = None
+    if pd is not None and isinstance(value, pd.DataFrame):
+        work = value.copy()
+        attrs = _jsonable(dict(work.attrs))
+        payload = json.loads(work.to_json(orient="split", date_format="iso"))
+        return {"__biga__": "df", "data": payload, "attrs": attrs}
+    if isinstance(value, dict):
+        return {"__biga__": "dict", "data": _jsonable(value)}
+    if isinstance(value, list):
+        return {"__biga__": "list", "data": _jsonable(value)}
+    return {"__biga__": "json", "data": _jsonable(value)}
+
+
+def decode_cache_value(payload):
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("__biga__")
+    if kind == "df":
+        import pandas as pd
+
+        data = payload.get("data") or {}
+        frame = pd.DataFrame(
+            data.get("data") or [],
+            columns=data.get("columns"),
+            index=data.get("index"),
+        )
+        if "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        attrs = payload.get("attrs") or {}
+        if isinstance(attrs, dict):
+            frame.attrs.update(attrs)
+        return frame
+    if kind == "dict":
+        data = payload.get("data")
+        return dict(data) if isinstance(data, dict) else {}
+    if kind == "list":
+        data = payload.get("data")
+        return list(data) if isinstance(data, list) else []
+    if kind == "json":
+        return payload.get("data")
+    return None
 
 
 @dataclass
@@ -138,15 +208,20 @@ class TTLCache:
         oldest = min(self._store.items(), key=lambda item: item[1].expires_at)[0]
         self._store.pop(oldest, None)
 
-    def get_entry(self, key, allow_expired=False):
+    def get_entry(self, key, allow_expired=False, max_stale_age=None):
         if not self.enabled:
             return None
         with self._lock:
             entry = self._store.get(key)
             if not entry:
                 return None
+            if not entry.ok:
+                return None
             if entry.expired(self.now()) and not allow_expired:
                 return None
+            if allow_expired and max_stale_age is not None:
+                if entry.age_seconds(self.now()) > float(max_stale_age):
+                    return None
             return entry
 
     def get(self, key):
@@ -160,6 +235,9 @@ class TTLCache:
             return None
         ttl = self.default_ttl if ttl is None else int(ttl)
         now = self.now()
+        if not ok:
+            self.set_cooldown(key, ttl)
+            return None
         with self._lock:
             if ttl <= 0:
                 self._store.pop(key, None)
@@ -169,7 +247,7 @@ class TTLCache:
                 value=_copy_value(value),
                 expires_at=now + ttl,
                 fetched_at=float(fetched_at if fetched_at is not None else now),
-                ok=bool(ok),
+                ok=True,
                 source=source,
                 session=session,
                 key=key,
@@ -230,7 +308,7 @@ class _FutureBox:
 
 
 class SharedTTLCache(TTLCache):
-    """内存 + 磁盘 + 单飞合并。磁盘写入原子替换；跨进程用文件锁。"""
+    """内存 + JSON 磁盘 + 跨进程文件锁合并。失败冷却不覆盖最后好数据。"""
 
     def __init__(
         self,
@@ -243,6 +321,8 @@ class SharedTTLCache(TTLCache):
         failure_ttl=45,
         success_max_ttl=3600,
         realtime_ttl=30,
+        stale_max_age=259200,
+        lock_timeout=8,
     ):
         super().__init__(max_size=max_size, default_ttl=default_ttl, enabled=enabled, clock=clock)
         self.persist = bool(persist)
@@ -250,6 +330,8 @@ class SharedTTLCache(TTLCache):
         self.failure_ttl = int(failure_ttl)
         self.success_max_ttl = int(success_max_ttl)
         self.realtime_ttl = int(realtime_ttl)
+        self.stale_max_age = int(stale_max_age)
+        self.lock_timeout = float(lock_timeout)
         self._inflight = {}
         self._inflight_lock = threading.Lock()
         if self.persist and self.directory is not None:
@@ -263,7 +345,7 @@ class SharedTTLCache(TTLCache):
         if not self.directory:
             return None
         safe = hashlib.sha1(key.encode("utf-8")).hexdigest()
-        return self.directory / f"biga-{CACHE_FORMAT}-{safe}.pkl"
+        return self.directory / f"biga-{CACHE_FORMAT}-{safe}.json"
 
     def _lock_path(self, key):
         path = self._disk_path(key)
@@ -276,10 +358,21 @@ class SharedTTLCache(TTLCache):
         if not self.persist or path is None or not path.exists():
             return None
         try:
-            with path.open("rb") as handle:
-                payload = pickle.load(handle)
-        except Exception as exc:
+            raw = path.read_bytes()
+        except OSError as exc:
             logger.warning("读取磁盘缓存失败: %s", exc)
+            return None
+        if not raw.startswith(CACHE_MAGIC):
+            logger.warning("拒绝不可信/非本格式缓存: %s", path.name)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        try:
+            payload = json.loads(raw[len(CACHE_MAGIC) :].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("磁盘缓存损坏，已丢弃: %s", exc)
             try:
                 path.unlink()
             except OSError:
@@ -287,11 +380,22 @@ class SharedTTLCache(TTLCache):
             return None
         if not isinstance(payload, dict) or payload.get("format") != CACHE_FORMAT:
             return None
+        if not payload.get("ok", True):
+            return None
+        try:
+            value = decode_cache_value(payload.get("value"))
+        except Exception as exc:
+            logger.warning("磁盘缓存反序列化失败: %s", exc)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
         return CacheEntry(
-            value=payload.get("value"),
+            value=value,
             expires_at=float(payload.get("expires_at") or 0),
             fetched_at=float(payload.get("fetched_at") or 0),
-            ok=bool(payload.get("ok", True)),
+            ok=True,
             source=payload.get("source"),
             session=payload.get("session"),
             key=key,
@@ -299,14 +403,14 @@ class SharedTTLCache(TTLCache):
 
     def _write_disk(self, key, entry: CacheEntry):
         path = self._disk_path(key)
-        if not self.persist or path is None:
+        if not self.persist or path is None or not entry.ok:
             return
         payload = {
             "format": CACHE_FORMAT,
-            "value": entry.value,
+            "value": encode_cache_value(entry.value),
             "expires_at": entry.expires_at,
             "fetched_at": entry.fetched_at,
-            "ok": entry.ok,
+            "ok": True,
             "source": entry.source,
             "session": entry.session,
             "key": key,
@@ -314,10 +418,15 @@ class SharedTTLCache(TTLCache):
         fd, tmp_name = tempfile.mkstemp(prefix=".biga-cache.", suffix=".tmp", dir=str(path.parent))
         try:
             with os.fdopen(fd, "wb") as handle:
-                pickle.dump(payload, handle, protocol=4)
+                handle.write(CACHE_MAGIC)
+                handle.write(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_name, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except Exception as exc:
             logger.warning("写入磁盘缓存失败: %s", exc)
             try:
@@ -325,62 +434,84 @@ class SharedTTLCache(TTLCache):
             except OSError:
                 pass
 
-    def _with_file_lock(self, key, fn):
+    def _with_file_lock(self, key, fn, timeout=None):
         lock_path = self._lock_path(key)
+        timeout = self.lock_timeout if timeout is None else float(timeout)
         if not self.persist or lock_path is None or fcntl is None:
             return fn()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                return fn()
-            finally:
+        deadline = time.monotonic() + max(0.0, timeout)
+        handle = lock_path.open("a+")
+        try:
+            while True:
                 try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("cache lock timeout")
+                    time.sleep(0.05)
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(str(os.getpid()))
+                handle.flush()
+            except OSError:
+                pass
+            return fn()
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
 
-    def get_entry(self, key, allow_expired=False):
+    def get_entry(self, key, allow_expired=False, max_stale_age=None):
         entry = super().get_entry(key, allow_expired=allow_expired)
-        if entry is not None:
-            return entry
-        disk = self._read_disk(key)
-        if disk is None:
+        if entry is None:
+            disk = self._read_disk(key)
+            if disk is None:
+                return None
+            now = self.now()
+            if disk.expired(now) and not allow_expired:
+                return None
+            remaining = max(1, int(disk.expires_at - now)) if not disk.expired(now) else 1
+            if not disk.expired(now):
+                super().set(
+                    key,
+                    disk.value,
+                    ttl=remaining,
+                    ok=True,
+                    source=disk.source,
+                    session=disk.session,
+                    fetched_at=disk.fetched_at,
+                )
+            entry = disk
+        if entry is None or not entry.ok:
             return None
-        now = self.now()
-        if disk.expired(now):
-            return disk if allow_expired else None
-        remaining = max(1, int(disk.expires_at - now))
-        super().set(
-            key,
-            disk.value,
-            ttl=remaining,
-            ok=disk.ok,
-            source=disk.source,
-            session=disk.session,
-            fetched_at=disk.fetched_at,
-        )
-        return super().get_entry(key) or disk
+        cap = self.stale_max_age if max_stale_age is None else max_stale_age
+        if allow_expired and cap is not None and entry.age_seconds(self.now()) > float(cap):
+            return None
+        return entry
 
     def set(self, key, value, ttl=None, ok=True, source=None, session=None, fetched_at=None):
+        if not ok:
+            self.set_cooldown(key, ttl if ttl is not None else self.failure_ttl)
+            return None
         entry = super().set(
             key,
             value,
             ttl=ttl,
-            ok=ok,
+            ok=True,
             source=source,
             session=session,
             fetched_at=fetched_at,
         )
         if entry is not None:
             self._write_disk(key, entry)
-        elif self.persist:
-            path = self._disk_path(key)
-            if path is not None:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
         return entry
 
     def clear(self):
@@ -396,8 +527,9 @@ class SharedTTLCache(TTLCache):
         except OSError:
             pass
 
-    def coalesce(self, key, loader, timeout=60):
-        """同一 key 并发只跑一次 loader。"""
+    def coalesce(self, key, loader, timeout=None):
+        """同一 key 进程内单飞；跨进程用 flock。timeout 同时约束等待与锁。"""
+        timeout = self.lock_timeout if timeout is None else float(timeout)
         with self._inflight_lock:
             box = self._inflight.get(key)
             owner = box is None
@@ -407,7 +539,7 @@ class SharedTTLCache(TTLCache):
         if not owner:
             return box.result(timeout=timeout)
         try:
-            result = self._with_file_lock(key, loader)
+            result = self._with_file_lock(key, loader, timeout=timeout)
             box.set_result(result)
             return result
         except Exception as exc:
@@ -439,6 +571,16 @@ def bound_failure_ttl(cfg=None):
     return max(1, min(int(getattr(cfg.cache, "ttl_failure", 45) or 45), 300))
 
 
+def bound_stale_age(cfg=None):
+    cfg = cfg or get_data_config()
+    return max(60, min(int(getattr(cfg.cache, "ttl_stale_max", 259200) or 259200), 7 * 86400))
+
+
+def bound_lock_timeout(cfg=None):
+    cfg = cfg or get_data_config()
+    return max(1.0, min(float(getattr(cfg.cache, "lock_timeout", 8) or 8), 30.0))
+
+
 def cached_load(
     cache,
     key,
@@ -450,15 +592,23 @@ def cached_load(
     source=None,
     session=None,
     is_success=None,
+    max_stale_age=None,
+    lock_timeout=None,
 ):
     """
-    命中新鲜缓存则返回；并发请求合并；失败短冷却；
-    上游失败时若有过期成功结果，标 stale 后返回，不得冒充新鲜。
+    命中新鲜缓存则返回；并发请求合并；失败短冷却与好数据分离。
+    空表/异常不得覆盖最后好缓存；失败命中 fresh=False；陈旧回退受最大年龄门控。
     """
     is_success = is_success or _is_success
     session = session or session_bucket()
     if cache is None:
         cache = get_cache()
+    stale_cap = max_stale_age
+    if stale_cap is None:
+        stale_cap = getattr(cache, "stale_max_age", None) or bound_stale_age()
+    lock_wait = lock_timeout
+    if lock_wait is None:
+        lock_wait = getattr(cache, "lock_timeout", None) or bound_lock_timeout()
 
     def _from_entry(entry, hit, stale=False):
         age = entry.age_seconds(cache.now()) if hasattr(cache, "now") else None
@@ -476,21 +626,31 @@ def cached_load(
             session=entry.session or session,
         )
 
+    def _stale_good():
+        if not hasattr(cache, "get_entry"):
+            return None
+        return cache.get_entry(key, allow_expired=True, max_stale_age=stale_cap)
+
+    def _failure_frame(hit):
+        stale = _stale_good()
+        if stale is not None and stale.ok:
+            return _from_entry(stale, "stale", stale=True)
+        if default is not None:
+            return stamp_cache_meta(default, hit=hit, stale=False, source=source, session=session)
+        return None
+
     if hasattr(cache, "in_cooldown") and cache.in_cooldown(key):
-        cooled = cache.get_entry(key, allow_expired=True) if hasattr(cache, "get_entry") else None
+        cooled = _failure_frame("cooldown")
         if cooled is not None:
-            stale = cooled.expired(cache.now()) if hasattr(cooled, "expired") else (not cooled.ok)
-            hit = "stale" if stale or not cooled.ok else "fresh"
-            return _from_entry(cooled, hit, stale=bool(stale or not cooled.ok))
+            return cooled
 
     fresh = cache.get_entry(key, allow_expired=False) if hasattr(cache, "get_entry") else None
-    if fresh is not None:
+    if fresh is not None and getattr(fresh, "ok", True):
         return _from_entry(fresh, "fresh", stale=False)
 
     def _load():
-        # 拿到锁后再看一次，避免惊群重复打上游
         again = cache.get_entry(key, allow_expired=False) if hasattr(cache, "get_entry") else cache.get(key)
-        if again is not None and hasattr(again, "value"):
+        if again is not None and hasattr(again, "value") and getattr(again, "ok", True):
             return _from_entry(again, "coalesced", stale=False)
         if again is not None and not hasattr(again, "value"):
             return stamp_cache_meta(again, hit="coalesced", source=source, session=session)
@@ -499,19 +659,28 @@ def cached_load(
         except Exception:
             if hasattr(cache, "set_cooldown"):
                 cache.set_cooldown(key, failure_ttl)
-            stale = cache.get_entry(key, allow_expired=True) if hasattr(cache, "get_entry") else None
-            if stale is not None and stale.ok:
-                labeled = _from_entry(stale, "stale", stale=True)
-                return labeled
+            good = _stale_good()
+            if good is not None and good.ok:
+                return _from_entry(good, "stale", stale=True)
             raise
         if value is None:
             value = default
         ok = is_success(value)
-        ttl = int(success_ttl if ok else min(int(success_ttl), int(failure_ttl)))
         if not ok:
-            ttl = int(failure_ttl)
+            if hasattr(cache, "set_cooldown"):
+                cache.set_cooldown(key, failure_ttl)
+            stale = _stale_good()
+            if stale is not None and stale.ok:
+                return _from_entry(stale, "stale", stale=True)
+            return stamp_cache_meta(
+                value if value is not None else default,
+                hit="failure",
+                stale=False,
+                source=source,
+                session=session,
+            )
         setter = getattr(cache, "set")
-        setter(key, value, ttl=ttl, ok=ok, source=source, session=session)
+        setter(key, value, ttl=int(success_ttl), ok=True, source=source, session=session)
         return stamp_cache_meta(
             value if value is not None else default,
             hit="miss",
@@ -523,11 +692,18 @@ def cached_load(
     coalesce = getattr(cache, "coalesce", None)
     if callable(coalesce):
         try:
-            return coalesce(key, _load)
+            return coalesce(key, _load, timeout=lock_wait)
+        except TimeoutError:
+            labeled = _failure_frame("stale")
+            if labeled is not None:
+                return labeled
+            if default is not None:
+                return stamp_cache_meta(default, hit="failure", stale=False, source=source, session=session)
+            raise
         except Exception:
-            stale = cache.get_entry(key, allow_expired=True) if hasattr(cache, "get_entry") else None
-            if stale is not None and stale.ok:
-                return _from_entry(stale, "stale", stale=True)
+            good = _stale_good()
+            if good is not None and good.ok:
+                return _from_entry(good, "stale", stale=True)
             if default is not None:
                 return stamp_cache_meta(default, hit="miss", stale=False, source=source, session=session)
             raise
@@ -554,6 +730,8 @@ def get_cache(cfg=None):
                 failure_ttl=getattr(cfg.cache, "ttl_failure", 45),
                 success_max_ttl=getattr(cfg.cache, "ttl_success_max", 3600),
                 realtime_ttl=cfg.cache.ttl_realtime,
+                stale_max_age=getattr(cfg.cache, "ttl_stale_max", 259200),
+                lock_timeout=getattr(cfg.cache, "lock_timeout", 8),
             )
         else:
             _CACHE.enabled = cfg.cache.enabled
@@ -565,6 +743,8 @@ def get_cache(cfg=None):
             _CACHE.failure_ttl = getattr(cfg.cache, "ttl_failure", 45)
             _CACHE.success_max_ttl = getattr(cfg.cache, "ttl_success_max", 3600)
             _CACHE.realtime_ttl = cfg.cache.ttl_realtime
+            _CACHE.stale_max_age = getattr(cfg.cache, "ttl_stale_max", 259200)
+            _CACHE.lock_timeout = getattr(cfg.cache, "lock_timeout", 8)
         return _CACHE
 
 

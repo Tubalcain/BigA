@@ -41,7 +41,7 @@ def _empty_reason(frame, fallback=""):
     return fallback
 
 
-def _show_empty(frame, fallback="接口暂时不可用（源站限流、字段变更或权限不足时会自动降级）。"):
+def _show_empty(frame, fallback="接口暂时不可用（超时、断连、空响应或权限不足时会降级）。"):
     st.info(fallback)
     reason = _empty_reason(frame)
     if reason:
@@ -72,13 +72,25 @@ def _render_fund_bias_card(bias):
 def _cache_caption(frame, label):
     if frame is None or not hasattr(frame, "attrs"):
         return
+    from src.analysis.fund_flow import frame_data_date as _frame_data_date
+
+    source = frame.attrs.get("cache_source") or frame.attrs.get("source") or ""
+    hit = frame.attrs.get("cache_hit") or ""
+    fetched = frame.attrs.get("cache_fetched_at") or ""
+    data_date = _frame_data_date(frame)
+    bits = [label]
+    if source:
+        bits.append(f"来源 {source}")
+    if data_date:
+        bits.append(f"数据日期 {data_date}")
     if frame.attrs.get("cache_stale"):
-        fetched = frame.attrs.get("cache_fetched_at") or "未知时间"
-        st.caption(f"{label}来自过期缓存（{fetched}），已标注来源/时效，不是新鲜数据。")
-    elif frame.attrs.get("cache_hit") in ("fresh", "coalesced"):
-        source = frame.attrs.get("cache_source") or frame.attrs.get("source") or ""
-        if source:
-            st.caption(f"{label}缓存命中 · 来源 {source}")
+        bits.append(f"过期缓存（{fetched or '未知时间'}），不是新鲜数据")
+    elif hit:
+        bits.append(f"缓存 {hit}")
+        if fetched:
+            bits.append(f"抓取 {fetched}")
+    if len(bits) > 1:
+        st.caption(" · ".join(bits))
 
 
 def _flow_table(df, extra=None, rows=20):
@@ -206,7 +218,7 @@ with tab2:
 
 with tab3:
     st.subheader("💰 资金流向")
-    st.caption("金额已统一为万元。主力 ≈ 超大单 + 大单；小单近似散户。顶部「资金面倾向」是 1–5 日方向，不是涨跌预测。源站限流或积分不足时会空表降级并标明原因。")
+    st.caption("金额已统一为万元。主力 ≈ 超大单 + 大单；小单近似散户。顶部「资金面倾向」是 1–5 日方向，不是涨跌预测。超时、断连、空响应或权限不足时会空表降级并标明原因，不把启发式限流文案当成已证实的 HTTP 429。")
 
     ctrl1, ctrl2, ctrl3 = st.columns(3)
     with ctrl1:

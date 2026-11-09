@@ -85,8 +85,10 @@ cache:
   ttl_realtime: 30    # 盘中快照 / 指数 / 资金流
   ttl_list: 3600      # 股票列表 / 基本信息
   ttl_calendar: 86400 # 交易日历
-  ttl_failure: 45     # 失败冷却，避免雪崩打上游
+  ttl_failure: 45     # 失败冷却，不覆盖最后好数据
   ttl_success_max: 3600
+  ttl_stale_max: 259200  # 跨日陈旧回退最大年龄（秒），超时不再当可展示回退
+  lock_timeout: 8        # 跨进程缓存锁等待上限，超时降级
   max_size: 1000
   directory: "data/cache"
 

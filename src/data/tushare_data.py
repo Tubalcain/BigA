@@ -13,14 +13,18 @@ import logging
 import pandas as pd
 
 from .cache import bound_failure_ttl, bound_success_ttl, cached_load, get_cache, make_cache_key
-from .calendar import session_bucket, shanghai_now
+from .calendar import shanghai_now
 from .config import get_data_config
 from .fetch import (
     SAME_UPSTREAM_EASTMONEY,
     DataFetchError,
+    infer_peer_reason,
     last_fetch_diagnostic,
+    mark_same_upstream_degrade,
     raise_if_cancelled,
+    redact_text,
     safe_fetch,
+    same_upstream_peer_allowed,
 )
 from .quality import (
     attach_date_swap,
@@ -91,7 +95,7 @@ class TuShareData:
         except Exception as exc:
             self._init_error = exc
             self._pro = None
-            logger.warning("TuShare 初始化失败: %s", exc)
+            logger.warning("TuShare 初始化失败: %s", redact_text(exc))
 
     def is_available(self):
         return bool(self.source_cfg.enabled and self.token and self._pro is not None)
@@ -126,13 +130,14 @@ class TuShareData:
             default=default,
             label=label,
             budget=self._budget(),
+            upstream="tushare",
         )
         if result is None or (isinstance(result, pd.DataFrame) and result.empty):
             return self._stamp_diag(result)
         return result
 
     def _cached(self, key_parts, ttl, loader, default, kind="generic"):
-        key = make_cache_key("TuShareData", session_bucket(), *key_parts)
+        key = make_cache_key("TuShareData", *key_parts)
 
         def wrapped():
             raise_if_cancelled()
@@ -157,7 +162,7 @@ class TuShareData:
     def _require(self):
         if not self.is_available():
             reason = "未配置 TUSHARE_TOKEN" if not self.token else (self._init_error or "TuShare 不可用")
-            raise DataFetchError(str(reason))
+            raise DataFetchError(redact_text(reason))
 
     def _peer(self):
         if not self.config.fallback:
@@ -171,9 +176,14 @@ class TuShareData:
             logger.warning("AKShare 回退不可用: %s", exc)
             return None
 
-    def _try_peer(self, method, *args, **kwargs):
-        if method in SAME_UPSTREAM_EASTMONEY:
-            logger.info("跳过同东财上游备用 %s（AKShare 东财接口与 TuShare *_dc 同源）", method)
+    def _try_peer(self, method, *args, reason=None, frame=None, **kwargs):
+        reason = reason or infer_peer_reason(
+            available=self.is_available(),
+            has_token=bool(self.token),
+            frame=frame,
+        )
+        if not same_upstream_peer_allowed(method, reason):
+            logger.info("跳过同东财上游备用 %s（传输故障不双打，reason=%s）", method, reason)
             return None
         other = self._peer()
         if other is None:
@@ -182,10 +192,14 @@ class TuShareData:
         if not callable(func):
             return None
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
         except Exception as exc:
             logger.warning("回退 %s 失败: %s", method, exc)
             return None
+        if method in SAME_UPSTREAM_EASTMONEY:
+            logger.info("同源东财降级 %s（reason=%s），不是独立备用", method, reason)
+            return mark_same_upstream_degrade(result, method)
+        return result
 
     def _fallback_history(self, code, start_date, end_date, period, adjust):
         df = self._try_peer(
@@ -840,7 +854,11 @@ class TuShareData:
         )
         if (result is None or result.empty) and allow_fallback:
             alt = self._try_peer(
-                "get_market_fund_flow", start or None, end or None, allow_fallback=False
+                "get_market_fund_flow",
+                start or None,
+                end or None,
+                allow_fallback=False,
+                frame=result,
             )
             if alt is not None and not alt.empty:
                 return attach_date_swap(alt, swapped)

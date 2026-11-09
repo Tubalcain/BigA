@@ -49,9 +49,12 @@ REQUIRED_NATIVE = (
 
 
 def _series(values, col="main_net_inflow"):
+    from src.data.calendar import expected_daily_data_date
+
+    end = pd.Timestamp(expected_daily_data_date())
     return pd.DataFrame(
         {
-            "date": pd.date_range("2024-01-01", periods=len(values), freq="D"),
+            "date": pd.bdate_range(end=end, periods=len(values)),
             col: values,
         }
     )
@@ -163,7 +166,9 @@ class SaimaSnapshotTests(unittest.TestCase):
             snapshot["sector_leaders"],
             ["半导体", "软件开发", "银行", "有色金属", "煤炭"],
         )
-        self.assertEqual(snapshot["latest_trade_date"], "2024-01-06")
+        from src.data.calendar import expected_daily_data_date
+
+        self.assertEqual(snapshot["latest_trade_date"], expected_daily_data_date().isoformat())
         encoded = json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
         self.assertNotIn("NaN", encoded)
         self.assertNotIn("Infinity", encoded)
@@ -251,7 +256,9 @@ class SaimaSnapshotTests(unittest.TestCase):
         self.assertTrue(snapshot.get("insufficient"))
         self.assertEqual(snapshot["score_delta"], 0)
         self.assertEqual(snapshot["confidence"], 0)
-        self.assertEqual(snapshot["latest_trade_date"], "2024-01-06")
+        from src.data.calendar import expected_daily_data_date
+
+        self.assertEqual(snapshot["latest_trade_date"], expected_daily_data_date().isoformat())
         self.assertNotEqual(snapshot["as_of_date"], snapshot["latest_trade_date"])
         json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
 

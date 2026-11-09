@@ -1,8 +1,9 @@
-"""带超时、有界重试与真实诊断的外部调用封装。"""
+"""带超时、有界重试、上游闸门与真实诊断的外部调用封装。"""
 
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import threading
@@ -10,10 +11,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 
 logger = logging.getLogger("biga.data.fetch")
 
-# 东财 push2 / datacenter 与 TuShare *_dc 是同一上游，不能当独立备用。
+# 东财 push2 / datacenter 与 TuShare *_dc 是同一上游，传输故障不得当独立备用。
 SAME_UPSTREAM_EASTMONEY = frozenset(
     {
         "get_market_fund_flow",
@@ -23,9 +27,28 @@ SAME_UPSTREAM_EASTMONEY = frozenset(
     }
 )
 
+# 授权/无 token 允许换客户端，但不把同源叫独立源。
+_AUTH_PEER_REASONS = frozenset({"permission", "no_token", "unavailable", "auth"})
+_TRANSPORT_PEER_REASONS = frozenset(
+    {
+        "transport",
+        "timeout",
+        "disconnect",
+        "empty",
+        "rate_limit_heuristic",
+        "http_429",
+        "http_5xx",
+        "http_4xx",
+        "http_403",
+        "non_json",
+    }
+)
+
 _SECRET_RE = re.compile(
     r"(?i)(token|api[_-]?key|secret|password|authorization)\s*[:=]\s*([^\s,;]+)"
 )
+_BEARER_RE = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|token|basic)\s+)(\S+)")
+_HEADER_AUTH_RE = re.compile(r"(?i)((?:x-)?(?:api[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*)(\S+)")
 _LONG_TOKEN_RE = re.compile(r"\b([A-Za-z0-9_-]{24,})\b")
 
 _DISCONNECT_MARKERS = (
@@ -72,6 +95,11 @@ _PERMISSION_MARKERS = (
     "未配置 tushare_token",
 )
 
+EASTMONEY_LIMIT = 2
+TUSHARE_LIMIT = 2
+GATE_ACQUIRE_TIMEOUT = 12
+ISOLATED_MAX_WORKERS = 2
+
 
 class DataFetchError(Exception):
     """可重试的数据获取失败。"""
@@ -95,6 +123,18 @@ class RateLimitError(DataFetchError):
 
 
 class FetchCancelled(DataFetchError):
+    retryable = False
+    category = "timeout"
+
+
+class InFlightBusy(DataFetchError):
+    """同键仍有超时后的后台线程在途，拒绝再开一条。"""
+
+    retryable = False
+    category = "timeout"
+
+
+class GateTimeout(DataFetchError):
     retryable = False
     category = "timeout"
 
@@ -136,14 +176,33 @@ class FetchDiagnostic:
 
 _CONTEXT = threading.local()
 _LAST_DIAG = threading.local()
+_INFLIGHT = {}
+_INFLIGHT_LOCK = threading.Lock()
+_GATES = {}
+_GATES_LOCK = threading.Lock()
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 
 def redact_text(value):
+    """脱敏 Authorization/Bearer/API key/token 及异常链。测试只用明显假 token。"""
     if value is None:
         return ""
-    text = str(value)
+    if isinstance(value, BaseException):
+        parts = []
+        for item in _walk_exceptions(value):
+            parts.append(str(item))
+        text = " | ".join(parts)
+    else:
+        text = str(value)
+    text = _BEARER_RE.sub(r"\1<redacted>", text)
+    text = _HEADER_AUTH_RE.sub(r"\1<redacted>", text)
     text = _SECRET_RE.sub(r"\1=<redacted>", text)
-    if "tushare" in text.lower() and _LONG_TOKEN_RE.search(text):
+    lowered = text.lower()
+    if "tushare" in lowered or "token" in lowered or "authorization" in lowered:
         text = _LONG_TOKEN_RE.sub("<redacted>", text)
     return text
 
@@ -199,19 +258,35 @@ def extract_retry_after(exc):
 def _parse_retry_after(raw):
     if raw is None or raw is False:
         return None
+    if isinstance(raw, (int, float)):
+        if float(raw) >= 0:
+            return float(raw)
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
     try:
-        value = float(raw)
+        value = float(text)
         if value >= 0:
             return value
     except (TypeError, ValueError):
+        pass
+    try:
+        parsed = parsedate_to_datetime(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = (parsed - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, float(delta))
+    except (TypeError, ValueError, OverflowError):
         return None
     return None
 
 
 def classify_exception(exc):
     """
-    按实际能观测到的信号分类。取不到 HTTP 状态码就是 unknown。
-    Push2RateLimitError / 文案里的「限流」不是已证实的 HTTP 429。
+    按实际能观测到的信号分类。
+    Push2RateLimitError / 文案「限流」在无 HTTP 码时是 rate_limit_heuristic，不是 429。
+    有明确 RemoteDisconnected cause 仍记 disconnect。
     """
     if exc is None:
         return FetchDiagnostic(category="unknown")
@@ -232,9 +307,21 @@ def classify_exception(exc):
         category = "http_403"
     elif status == 401:
         category = "permission"
-    elif status is not None:
-        category = "unknown"
+    elif status == 408:
+        category = "timeout"
+        hint = "http_408"
+    elif status is not None and 500 <= int(status) <= 599:
+        category = "http_5xx"
         hint = f"http_{status}"
+    elif status is not None and 400 <= int(status) < 500:
+        category = "http_4xx"
+        hint = f"http_{status}"
+    elif isinstance(exc, GateTimeout):
+        category = "timeout"
+        hint = "upstream_gate"
+    elif isinstance(exc, InFlightBusy):
+        category = "timeout"
+        hint = "inflight"
     elif isinstance(exc, (TimeoutError, FutureTimeout, FetchCancelled)) or any(
         marker in blob for marker in _TIMEOUT_MARKERS
     ):
@@ -250,10 +337,14 @@ def classify_exception(exc):
     else:
         category = "unknown"
 
-    if "push2ratelimiterror" in blob or ("限流" in messages and status != 429):
+    heuristic = "push2ratelimiterror" in blob or ("限流" in messages and status != 429)
+    if heuristic:
         hint = hint or "upstream_rate_limit_heuristic"
-        if category == "unknown" and any(marker in blob for marker in _DISCONNECT_MARKERS):
-            category = "disconnect"
+        if category == "unknown":
+            if any(marker in blob for marker in _DISCONNECT_MARKERS):
+                category = "disconnect"
+            else:
+                category = "rate_limit_heuristic"
 
     diag = FetchDiagnostic(
         category=category,
@@ -271,6 +362,62 @@ def is_rate_limited(exc):
     if isinstance(exc, RateLimitError):
         return True
     return extract_http_status(exc) == 429
+
+
+def same_upstream_peer_allowed(method, reason=None):
+    """
+    同源东财：传输故障拒绝备用（避免双打）；授权/无 token 允许换客户端。
+    允许时仍须标明 same_upstream_degrade，不得称为独立源。
+    """
+    if method not in SAME_UPSTREAM_EASTMONEY:
+        return True
+    if reason in _AUTH_PEER_REASONS:
+        return True
+    if reason in _TRANSPORT_PEER_REASONS:
+        return False
+    if reason is None:
+        diag = last_fetch_diagnostic()
+        if diag is not None and diag.category in ("permission",):
+            return True
+        if diag is None:
+            return False
+        return diag.category in ("permission",)
+    return False
+
+
+def infer_peer_reason(*, available=True, has_token=True, frame=None, exc=None):
+    if not available:
+        return "no_token" if not has_token else "unavailable"
+    if exc is not None:
+        category = classify_exception(exc).category
+        if category == "permission":
+            return "permission"
+        return "transport"
+    blob_parts = []
+    if frame is not None and hasattr(frame, "attrs"):
+        blob_parts.extend(str(item) for item in (frame.attrs.get("issues") or []))
+        blob_parts.append(str(frame.attrs.get("error") or ""))
+    blob = " ".join(blob_parts)
+    if any(marker in blob for marker in _PERMISSION_MARKERS) or "积分" in blob:
+        return "permission"
+    diag = last_fetch_diagnostic()
+    if diag is not None and diag.category == "permission":
+        return "permission"
+    if diag is not None and diag.category in _TRANSPORT_PEER_REASONS:
+        return "transport"
+    return "transport"
+
+
+def mark_same_upstream_degrade(frame, method):
+    if frame is None or method not in SAME_UPSTREAM_EASTMONEY or not hasattr(frame, "attrs"):
+        return frame
+    issues = list(frame.attrs.get("issues") or [])
+    marker = "same_upstream_degrade:eastmoney"
+    if marker not in issues:
+        issues.append(marker)
+    frame.attrs["issues"] = issues
+    frame.attrs["independent_backup"] = False
+    return frame
 
 
 def current_deadline():
@@ -314,38 +461,213 @@ def _pop_context(prev):
     _CONTEXT.deadline, _CONTEXT.cancelled = prev
 
 
-def call_with_timeout(func, timeout, *args, **kwargs):
-    """
-    在独立线程中执行调用。timeout<=0 表示不限时。
+def _gate_directory():
+    try:
+        from .config import cache_dir
 
-    底层线程无法被强制杀掉；超时后立刻把错误返回，并置位 cancelled，
-    调用方不得再开新的分页/重试。后台线程若仍在跑，不再跟新请求。
+        return cache_dir()
+    except Exception:
+        return Path(os.environ.get("BIGA_CACHE_DIR") or "data/cache")
+
+
+class _FileSemaphore:
+    """跨进程有界并发。崩溃由 OS 释放 flock；挂起的 owner 只阻塞到 timeout。"""
+
+    def __init__(self, name, limit, timeout=GATE_ACQUIRE_TIMEOUT, directory=None):
+        self.name = name
+        self.limit = max(1, int(limit))
+        self.timeout = float(timeout)
+        self.directory = Path(directory) if directory is not None else _gate_directory()
+        self._local = threading.BoundedSemaphore(self.limit)
+        self._held = threading.local()
+
+    def acquire(self, timeout=None):
+        timeout = self.timeout if timeout is None else float(timeout)
+        deadline = time.monotonic() + max(0.0, timeout)
+        wait = max(0.0, deadline - time.monotonic())
+        if not self._local.acquire(timeout=wait):
+            raise GateTimeout(f"upstream gate busy: {self.name}")
+        try:
+            fd = self._acquire_slot(deadline)
+            self._held.fd = fd
+            return True
+        except Exception:
+            self._local.release()
+            raise
+
+    def _acquire_slot(self, deadline):
+        if fcntl is None:
+            return None
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        while True:
+            for index in range(self.limit):
+                path = self.directory / f"gate-{self.name}-{index}.lock"
+                handle = path.open("a+")
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    try:
+                        handle.seek(0)
+                        handle.truncate()
+                        handle.write(str(os.getpid()))
+                        handle.flush()
+                    except OSError:
+                        pass
+                    return handle
+                except BlockingIOError:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                    continue
+                except OSError:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                    continue
+            if time.monotonic() >= deadline:
+                raise GateTimeout(f"upstream gate timeout: {self.name}")
+            time.sleep(0.05)
+
+    def release(self):
+        handle = getattr(self._held, "fd", None)
+        if handle is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+            self._held.fd = None
+        try:
+            self._local.release()
+        except ValueError:
+            pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
+def upstream_gate(name="eastmoney", limit=None, timeout=None, directory=None):
+    key = str(name or "other")
+    if key in ("eastmoney", "akshare"):
+        cap = EASTMONEY_LIMIT if limit is None else int(limit)
+        key = "eastmoney"
+    elif key == "tushare":
+        cap = TUSHARE_LIMIT if limit is None else int(limit)
+    else:
+        cap = 4 if limit is None else int(limit)
+    with _GATES_LOCK:
+        gate = _GATES.get(key)
+        if gate is None or (directory is not None and Path(directory) != gate.directory):
+            gate = _FileSemaphore(
+                key,
+                cap,
+                timeout=GATE_ACQUIRE_TIMEOUT if timeout is None else timeout,
+                directory=directory,
+            )
+            _GATES[key] = gate
+        elif timeout is not None:
+            gate.timeout = float(timeout)
+        return gate
+
+
+def reset_upstream_gates():
+    with _GATES_LOCK:
+        _GATES.clear()
+
+
+def call_with_timeout(func, timeout, *args, inflight_key=None, **kwargs):
+    """
+    在 daemon 线程中执行调用。timeout<=0 表示不限时。
+
+    无法强制终止第三方（AKShare 分页）线程：超时后立刻把错误返回给调用方。
+    同 inflight_key 在途时拒绝再开一条，避免叠加。进程退出不因这些线程卡住
+    （daemon）。threading.local 的 cancel 不会传到 worker，不要宣称能停上游分页。
     """
     if not timeout or timeout <= 0:
         raise_if_cancelled()
         return func(*args, **kwargs)
+    key = inflight_key or None
+    if key:
+        with _INFLIGHT_LOCK:
+            existing = _INFLIGHT.get(key)
+            if existing is not None and existing.is_alive():
+                raise InFlightBusy(f"in-flight {key}: skip stacked call")
     cancelled = current_cancelled() or threading.Event()
     deadline = time.monotonic() + float(timeout)
     prev = _push_context(deadline, cancelled)
-    pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(func, *args, **kwargs)
+    box = {"value": None, "error": None}
+
+    def runner():
+        try:
+            box["value"] = func(*args, **kwargs)
+        except Exception as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(
+        target=runner,
+        name=f"biga-fetch-{key or getattr(func, '__name__', 'anon')}",
+        daemon=True,
+    )
+    if key:
+        with _INFLIGHT_LOCK:
+            current = _INFLIGHT.get(key)
+            if current is not None and current.is_alive():
+                raise InFlightBusy(f"in-flight {key}: skip stacked call")
+            _INFLIGHT[key] = thread
+    thread.start()
     try:
-        return future.result(timeout=timeout)
-    except FutureTimeout as exc:
-        cancelled.set()
-        raise DataFetchError(f"调用超时（{timeout}s）: {func}") from exc
+        thread.join(timeout)
+        if thread.is_alive():
+            cancelled.set()
+            raise DataFetchError(f"调用超时（{timeout}s）: {func}")
+        if box["error"] is not None:
+            raise box["error"]
+        return box["value"]
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        if key and not thread.is_alive():
+            with _INFLIGHT_LOCK:
+                if _INFLIGHT.get(key) is thread:
+                    _INFLIGHT.pop(key, None)
         _pop_context(prev)
 
 
+def inflight_alive(key):
+    with _INFLIGHT_LOCK:
+        thread = _INFLIGHT.get(key)
+        return bool(thread is not None and thread.is_alive())
+
+
 def _retryable_category(category, status=None):
-    if category in ("http_429", "http_403", "permission", "empty", "non_json", "timeout"):
+    if category in (
+        "http_429",
+        "http_403",
+        "http_4xx",
+        "permission",
+        "empty",
+        "non_json",
+        "timeout",
+        "rate_limit_heuristic",
+    ):
         return False
-    if category == "disconnect":
+    if category in ("disconnect", "http_5xx"):
         return True
     if status is not None and 500 <= int(status) <= 599:
         return True
+    if status is not None and 400 <= int(status) < 500:
+        return False
     return category == "unknown"
 
 
@@ -365,10 +687,12 @@ def with_retry(
     budget=None,
     jitter=True,
     label="",
+    inflight_key=None,
 ):
     """
     执行 func()，失败则有界退避。总时间受 budget 约束。
-    超时不重试（避免后台分页叠加）。HTTP 429 最多尊重一次 Retry-After。
+    超时/启发式限流/4xx 不重试。HTTP 429 最多尊重一次 Retry-After（数字或 HTTP-date）。
+    无法杀掉第三方线程；同键在途则跳过叠加。
     """
     retry_exceptions = retry_exceptions or (
         DataFetchError,
@@ -388,6 +712,7 @@ def with_retry(
     last_error = None
     last_diag = FetchDiagnostic(label=label)
     respected_retry_after = False
+    key = inflight_key or label or None
     try:
         for attempt in range(1, attempts + 1):
             raise_if_cancelled()
@@ -403,10 +728,12 @@ def with_retry(
             if timeout > 0:
                 attempt_timeout = min(timeout, remaining)
             try:
-                result = call_with_timeout(func, attempt_timeout)
+                result = call_with_timeout(func, attempt_timeout, inflight_key=key)
                 last_diag.attempts = attempt
                 last_diag.elapsed_ms = int((time.monotonic() - started) * 1000)
-                last_diag.category = last_diag.category or "ok"
+                last_diag.category = "ok"
+                last_diag.hint = ""
+                last_diag.message = ""
                 set_last_fetch_diagnostic(last_diag)
                 return result
             except EmptyDataError:
@@ -419,6 +746,13 @@ def with_retry(
                 set_last_fetch_diagnostic(last_diag)
                 raise
             except FetchCancelled:
+                raise
+            except InFlightBusy as exc:
+                last_diag = classify_exception(exc)
+                last_diag.attempts = attempt
+                last_diag.elapsed_ms = int((time.monotonic() - started) * 1000)
+                last_diag.label = label
+                set_last_fetch_diagnostic(last_diag)
                 raise
             except Exception as exc:
                 last_error = exc
@@ -450,9 +784,13 @@ def with_retry(
                     if isinstance(exc, DataFetchError):
                         raise
                     raise DataFetchError(redact_text(exc)) from exc
+                if diag.category == "rate_limit_heuristic":
+                    if isinstance(exc, DataFetchError):
+                        raise
+                    raise DataFetchError(redact_text(exc)) from exc
                 retryable = diag.category == "disconnect" or (
                     _retryable_category(diag.category, diag.http_status)
-                    and (isinstance(exc, retry_exceptions) or diag.category == "unknown")
+                    and (isinstance(exc, retry_exceptions) or diag.category in ("unknown", "http_5xx"))
                 )
                 if (not retryable) or attempt >= attempts:
                     if isinstance(exc, DataFetchError):
@@ -480,9 +818,19 @@ def with_retry(
         _pop_context(prev)
 
 
-def safe_fetch(func, retries=3, timeout=30, default=None, label="", budget=None, delay=0.8):
+def safe_fetch(
+    func,
+    retries=3,
+    timeout=30,
+    default=None,
+    label="",
+    budget=None,
+    delay=0.8,
+    upstream=None,
+):
     """捕获全部异常，失败时返回 default，供页面侧优雅降级。"""
-    try:
+
+    def _call():
         return with_retry(
             func,
             retries=retries,
@@ -490,7 +838,18 @@ def safe_fetch(func, retries=3, timeout=30, default=None, label="", budget=None,
             delay=delay,
             budget=budget,
             label=label,
+            inflight_key=label or None,
         )
+
+    try:
+        if upstream:
+            remaining = None
+            if budget:
+                remaining = float(budget)
+            gate = upstream_gate(upstream, timeout=min(GATE_ACQUIRE_TIMEOUT, remaining or GATE_ACQUIRE_TIMEOUT))
+            with gate:
+                return _call()
+        return _call()
     except Exception as exc:
         diag = last_fetch_diagnostic() or classify_exception(exc)
         diag.label = label or diag.label
@@ -519,10 +878,11 @@ def safe_fetch(func, retries=3, timeout=30, default=None, label="", budget=None,
         return default
 
 
-def run_isolated(jobs, timeout=None):
+def run_isolated(jobs, timeout=None, max_workers=None):
     """
     并行执行互不依赖的任务，单腿超时互不影响。
-    返回 {name: result}；失败腿为 None，诊断在 last job attrs / 日志。
+    默认最多 2 个 worker，再叠加上游闸门，避免 Web 5 路 / CLI 3 路齐打同一东财。
+    不靠加大 timeout。其它数据源走独立闸门，避免交叉锁死。
     """
     jobs = dict(jobs or {})
     if not jobs:
@@ -532,10 +892,10 @@ def run_isolated(jobs, timeout=None):
     def _run(name, func):
         raise_if_cancelled()
         if timeout and timeout > 0:
-            return call_with_timeout(func, timeout)
+            return call_with_timeout(func, timeout, inflight_key=f"isolated:{name}")
         return func()
 
-    workers = min(len(jobs), 4)
+    workers = min(len(jobs), ISOLATED_MAX_WORKERS if max_workers is None else int(max_workers))
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futs = {pool.submit(_run, name, func): name for name, func in jobs.items()}
         for fut in as_completed(futs):

@@ -14,14 +14,17 @@ import pandas as pd
 from src.analysis.technical import TechnicalAnalyzer
 
 from .cache import bound_failure_ttl, bound_success_ttl, cached_load, get_cache, make_cache_key
-from .calendar import session_bucket, shanghai_now
+from .calendar import shanghai_now
 from .config import get_data_config
 from .fetch import (
     SAME_UPSTREAM_EASTMONEY,
     DataFetchError,
+    infer_peer_reason,
     last_fetch_diagnostic,
+    mark_same_upstream_degrade,
     raise_if_cancelled,
     safe_fetch,
+    same_upstream_peer_allowed,
 )
 from .quality import (
     attach_date_swap,
@@ -122,9 +125,10 @@ class AKShareData:
             logger.warning("TuShare 回退不可用: %s", exc)
             return None
 
-    def _try_peer(self, method, *args, **kwargs):
-        if method in SAME_UPSTREAM_EASTMONEY:
-            logger.info("跳过同东财上游备用 %s（TuShare *_dc 与东财 push2 同源）", method)
+    def _try_peer(self, method, *args, reason=None, frame=None, **kwargs):
+        reason = reason or infer_peer_reason(available=self.is_available(), frame=frame)
+        if not same_upstream_peer_allowed(method, reason):
+            logger.info("跳过同东财上游备用 %s（传输故障不双打，reason=%s）", method, reason)
             return None
         other = self._peer()
         if other is None:
@@ -133,10 +137,14 @@ class AKShareData:
         if not callable(func):
             return None
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
         except Exception as exc:
             logger.warning("回退 %s 失败: %s", method, exc)
             return None
+        if method in SAME_UPSTREAM_EASTMONEY:
+            logger.info("同源东财降级 %s（reason=%s），不是独立备用", method, reason)
+            return mark_same_upstream_degrade(result, method)
+        return result
 
     def _stamp_diag(self, value):
         diag = last_fetch_diagnostic()
@@ -159,13 +167,14 @@ class AKShareData:
             default=default,
             label=label,
             budget=self._budget(),
+            upstream="eastmoney",
         )
         if result is None or (isinstance(result, pd.DataFrame) and result.empty):
             return self._stamp_diag(result)
         return result
 
     def _cached(self, key_parts, ttl, loader, default, kind="generic"):
-        key = make_cache_key("AKShareData", session_bucket(), *key_parts)
+        key = make_cache_key("AKShareData", *key_parts)
 
         def wrapped():
             raise_if_cancelled()
@@ -241,23 +250,31 @@ class AKShareData:
                 issues=["akshare unavailable"],
             )
 
-        key = ("history", code, start, end, period_key, adj)
-        cache_key = make_cache_key("AKShareData", *key)
-        cached = self.cache.get(cache_key)
-        if cached is not None and validate_ohlcv(cached)[0]:
-            return cached
+        def loader():
+            try:
+                df = self._fetch_history(
+                    code, start, end, period_key, adj,
+                    filter_start=start_date, filter_end=end_date,
+                )
+            except Exception as exc:
+                logger.warning("AKShare 历史拉取异常 %s: %s", code, exc)
+                return empty_ohlcv("akshare", error=str(exc), issues=["fetch failed"])
+            ok, issues = validate_ohlcv(df)
+            if ok:
+                return df
+            if df is None:
+                return empty_ohlcv("akshare", issues=issues)
+            return df
 
-        try:
-            df = self._fetch_history(
-                code, start, end, period_key, adj,
-                filter_start=start_date, filter_end=end_date,
-            )
-        except Exception as exc:
-            logger.warning("AKShare 历史拉取异常 %s: %s", code, exc)
-            df = empty_ohlcv("akshare", error=str(exc), issues=["fetch failed"])
-        ok, issues = validate_ohlcv(df)
+        df = self._cached(
+            ("history", code, start, end, period_key, adj),
+            self.cache_ttl,
+            loader,
+            empty_ohlcv("akshare"),
+            kind="generic",
+        )
+        ok, issues = validate_ohlcv(df) if df is not None else (False, ["empty frame"])
         if ok:
-            self.cache.set(cache_key, df, ttl=self.cache_ttl)
             return attach_date_swap(df, swapped)
         if allow_fallback:
             fallback = self._fallback_history(code, start, end, period_key, adj)

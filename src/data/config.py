@@ -83,6 +83,8 @@ class CacheConfig:
     ttl_calendar: int = 86400
     ttl_failure: int = 45
     ttl_success_max: int = 3600
+    ttl_stale_max: int = 259200
+    lock_timeout: int = 8
     persist: bool = True
     max_size: int = 1000
     directory: str = "data/cache"
@@ -123,6 +125,8 @@ def _cache_from_yaml(raw, defaults):
         ttl_calendar=_as_int(raw.get("ttl_calendar"), defaults.ttl_calendar),
         ttl_failure=_as_int(raw.get("ttl_failure"), defaults.ttl_failure),
         ttl_success_max=_as_int(raw.get("ttl_success_max"), defaults.ttl_success_max),
+        ttl_stale_max=_as_int(raw.get("ttl_stale_max"), defaults.ttl_stale_max),
+        lock_timeout=_as_int(raw.get("lock_timeout"), defaults.lock_timeout),
         persist=_as_bool(raw.get("persist"), defaults.persist),
         max_size=_as_int(raw.get("max_size"), defaults.max_size),
         directory=str(raw.get("directory") or defaults.directory),
